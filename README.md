@@ -1,4 +1,4 @@
-# pi-package-template
+# @jangmanj/pi-mcp-ext
 
 A template for Pi packages published to npm. It has CI, releases on a tag push through npm
 trusted publishing with provenance, Dependabot, and a test that installs the packed tarball
