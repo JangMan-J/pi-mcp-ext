@@ -7,8 +7,7 @@
  */
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
-import { writePrivateTempFile } from "./temp-files.ts";
+import { convertMcpContentBlocks, frameMcpTag, paginateMcp } from "./framing.ts";
 import {
   CUSTOM_RESOURCE_SUBSCRIPTIONS,
   ErrorCode,
@@ -103,15 +102,6 @@ function isRecord(v: unknown): v is JsonObject {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function escapeAttr(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
 function isMcpAppResource(uri: string, mimeType?: string): boolean {
   if (uri.toLowerCase().startsWith("ui://")) return true;
   if (mimeType && mimeType.toLowerCase().includes("profile=mcp-app")) return true;
@@ -133,65 +123,12 @@ function toReqOpts(opts?: LogOpts) {
     : undefined;
 }
 
-function extFromMime(mimeType?: string): string {
-  if (!mimeType) return "bin";
-  const clean = mimeType.split(";")[0].trim().toLowerCase();
-  const slash = clean.indexOf("/");
-  const sub = slash >= 0 ? clean.slice(slash + 1) : clean;
-  const safe = sub.replace(/[^a-z0-9.+-]/g, "");
-  return safe || "bin";
-}
-
+/** Resource contents (`resources/read`) to Pi content; delegates to `convertMcpContentBlocks`. */
 export function convertResourceContentsToBlocks(
   server: string,
   contents: readonly JsonObject[],
 ): Array<TextContent | ImageContent> {
-  const blocks: Array<TextContent | ImageContent> = [];
-  for (const item of contents) {
-    const uri = typeof item.uri === "string" ? item.uri : "";
-    const mimeType = typeof item.mimeType === "string" ? item.mimeType : undefined;
-    if (typeof item.text === "string") {
-      const truncated = truncateHead(item.text, {
-        maxBytes: DEFAULT_MAX_BYTES,
-        maxLines: DEFAULT_MAX_LINES,
-      });
-      let text = truncated.content;
-      if (truncated.truncated) {
-        try {
-          const file = writePrivateTempFile("mcp-resource", "txt", item.text);
-          text += `\n[truncated: full resource written to ${file}]`;
-        } catch {
-          text += "\n[truncated]";
-        }
-      }
-      blocks.push({ type: "text", text });
-      continue;
-    }
-    if (typeof item.blob === "string") {
-      if (mimeType && /^image\/(png|jpeg|jpg|gif|webp)$/i.test(mimeType.split(";")[0].trim())) {
-        blocks.push({
-          type: "image",
-          data: item.blob,
-          mimeType: mimeType.split(";")[0].trim(),
-        });
-        continue;
-      }
-      try {
-        const bytes = Buffer.from(item.blob, "base64");
-        const file = writePrivateTempFile("mcp-resource", extFromMime(mimeType), bytes);
-        blocks.push({
-          type: "text",
-          text: `Binary resource "${uri}" from MCP server "${server}" (${mimeType ?? "application/octet-stream"}, ${bytes.length} bytes) saved to ${file}`,
-        });
-      } catch {
-        blocks.push({
-          type: "text",
-          text: `Binary resource "${uri}" from MCP server "${server}" (${mimeType ?? "application/octet-stream"})`,
-        });
-      }
-    }
-  }
-  return blocks;
+  return convertMcpContentBlocks(server, contents, { truncate: "head", tempPrefix: "mcp-resource" }).content;
 }
 
 function timer(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
@@ -244,12 +181,10 @@ export function createResourcesEngine(
       const uris = [...entry.uris];
       details.push({ server: entry.server, updatedUris: uris, listChanged: entry.listChanged });
       if (entry.listChanged) {
-        parts.push(`<mcp_resources_list_changed server="${escapeAttr(entry.server)}" />`);
+        parts.push(frameMcpTag("mcp_resources_list_changed", { server: entry.server }));
       }
       for (const uri of uris) {
-        parts.push(
-          `<mcp_resource_updated server="${escapeAttr(entry.server)}" uri="${escapeAttr(uri)}" />`,
-        );
+        parts.push(frameMcpTag("mcp_resource_updated", { server: entry.server, uri }));
       }
     }
     host.wake(MESSAGE_RESOURCE, parts.join("\n"), { resources: details });
@@ -353,31 +288,23 @@ export function createResourcesEngine(
       };
     }
 
-    const all: McpResourceItem[] = [];
-    const seen = new Set<string>();
-    let next: string | undefined;
-    for (let i = 0; i < 1_000; i += 1) {
-      const page = await client.request<JsonObject>(
-        "resources/list",
-        next ? { cursor: next } : {},
-        reqOpts,
-      );
-      const rawList = Array.isArray(page.resources) ? page.resources : [];
-      for (const item of rawList) {
-        if (!isRecord(item) || typeof item.uri !== "string") continue;
-        if (isMcpAppResource(item.uri, item.mimeType as string | undefined)) continue;
-        all.push(stripResourceIcons(item) as unknown as McpResourceItem);
-      }
-      if (typeof page.nextCursor !== "string" || !page.nextCursor) {
-        return { resources: all };
-      }
-      if (seen.has(page.nextCursor)) {
-        throw new McpTransportError("protocol", `Duplicate pagination cursor on resources/list for "${server}"`);
-      }
-      seen.add(page.nextCursor);
-      next = page.nextCursor;
-    }
-    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on resources/list for "${server}"`);
+    const resources = await paginateMcp(
+      client,
+      "resources/list",
+      (page) => {
+        const rawList = Array.isArray(page.resources) ? page.resources : [];
+        const out: McpResourceItem[] = [];
+        for (const item of rawList) {
+          if (!isRecord(item) || typeof item.uri !== "string") continue;
+          if (isMcpAppResource(item.uri, item.mimeType as string | undefined)) continue;
+          out.push(stripResourceIcons(item) as unknown as McpResourceItem);
+        }
+        return out;
+      },
+      {},
+      reqOpts,
+    );
+    return { resources };
   }
 
   async function templates(
@@ -398,31 +325,19 @@ export function createResourcesEngine(
           ...(typeof page.nextCursor === "string" ? { nextCursor: page.nextCursor } : {}),
         };
       }
-      const all: McpResourceTemplateItem[] = [];
-      const seen = new Set<string>();
-      let next: string | undefined;
-      for (let i = 0; i < 1_000; i += 1) {
-        const page = await client.request<JsonObject>(
-          "resources/templates/list",
-          next ? { cursor: next } : {},
-          reqOpts,
-        );
-        const rawList = Array.isArray(page.resourceTemplates) ? page.resourceTemplates : [];
-        for (const item of rawList) {
-          if (isRecord(item) && typeof item.uriTemplate === "string") {
-            all.push(stripResourceIcons(item) as unknown as McpResourceTemplateItem);
-          }
-        }
-        if (typeof page.nextCursor !== "string" || !page.nextCursor) {
-          return { resourceTemplates: all };
-        }
-        if (seen.has(page.nextCursor)) {
-          throw new McpTransportError("protocol", `Duplicate pagination cursor on resources/templates/list for "${server}"`);
-        }
-        seen.add(page.nextCursor);
-        next = page.nextCursor;
-      }
-      throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on resources/templates/list for "${server}"`);
+      const resourceTemplates = await paginateMcp(
+        client,
+        "resources/templates/list",
+        (page) => {
+          const rawList = Array.isArray(page.resourceTemplates) ? page.resourceTemplates : [];
+          return rawList
+            .filter((item): item is JsonObject => isRecord(item) && typeof item.uriTemplate === "string")
+            .map((item) => stripResourceIcons(item) as unknown as McpResourceTemplateItem);
+        },
+        {},
+        reqOpts,
+      );
+      return { resourceTemplates };
     } catch (err) {
       if (err instanceof McpRpcError && err.code === ErrorCode.MethodNotFound) {
         return { resourceTemplates: [] };
@@ -447,9 +362,6 @@ export function createResourcesEngine(
       }
       const contents = result.contents.filter(isRecord);
       const blocks = convertResourceContentsToBlocks(server, contents);
-      if (blocks.length === 0) {
-        blocks.push({ type: "text", text: "" });
-      }
       return { contents, blocks };
     } catch (err) {
       if (err instanceof McpRpcError && (err.code === -32602 || err.code === -32002)) {

@@ -1,4 +1,5 @@
 import { resolveConfigValueAsync } from "./config.ts";
+import { paginateMcp } from "./framing.ts";
 import { createHttpTransport, paramHeaders, validateXMcpHeaders } from "./transport-http.ts";
 import { createStdioTransport } from "./transport-stdio.ts";
 import {
@@ -106,7 +107,6 @@ export interface ClientDeps {
   ) => Promise<JsonObject | undefined>;
 }
 
-const MAX_PAGINATION_PAGES = 1_000;
 const MAX_MRTR_ROUNDS = 8;
 
 type HeaderDescriptor = { header: string; path: string[] };
@@ -434,18 +434,8 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     if (toolHeaderListing) return toolHeaderListing;
     toolHeaderListing = (async () => {
       toolHeaders.clear();
-      let cursor: string | undefined;
-      const seen = new Set<string>();
-      for (let page = 0; page < MAX_PAGINATION_PAGES; page += 1) {
-        const result = await rawRequest<JsonObject>("tools/list", cursor ? { cursor } : undefined);
-        if (typeof result.nextCursor !== "string" || !result.nextCursor) return;
-        if (seen.has(result.nextCursor)) {
-          throw new McpTransportError("protocol", `Duplicate pagination cursor on tools/list for "${config.name}"`);
-        }
-        seen.add(result.nextCursor);
-        cursor = result.nextCursor;
-      }
-      throw new McpTransportError("protocol", `Pagination limit (${MAX_PAGINATION_PAGES} pages) exceeded on tools/list`);
+      // rawRequest records each tools/list page's x-mcp-header descriptors as it arrives.
+      await paginateMcp({ name: config.name, request: rawRequest }, "tools/list", () => []);
     })().finally(() => {
       toolHeaderListing = undefined;
     });

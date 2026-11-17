@@ -5,13 +5,13 @@
  */
 
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
+import { escapeMcpAttr, frameMcpTag, paginateMcp } from "./framing.ts";
 import { writePrivateTempFile } from "./temp-files.ts";
 import {
   CUSTOM_CURSORS,
   CUSTOM_SUBSCRIPTIONS,
   ErrorCode,
   MESSAGE_EVENT,
-  McpTransportError,
 } from "./types.ts";
 import type {
   CursorEntry,
@@ -53,19 +53,6 @@ export function subKeyOf(server: string, name: string, args?: Record<string, unk
   return `${server}\0${name}\0${canonicalJson(args ?? {})}`;
 }
 
-function escapeAttr(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function escapeXmlCloseTags(value: string): string {
-  return value.replace(/<\/(mcp_[a-zA-Z0-9_]*)/gi, "<\\/$1");
-}
-
 /**
  * Frame deliveries as untrusted external data: one `<mcp_event ...>` tag per occurrence with a
  * JSON body (head-truncated; the full payload goes to a temp file when truncated), preceded by a
@@ -76,14 +63,17 @@ export function formatEventDeliveries(batch: EventDelivery[]): string {
   for (const delivery of batch) {
     if (delivery.truncated) {
       parts.push(
-        `<mcp_event_gap server="${escapeAttr(delivery.server)}" name="${escapeAttr(delivery.name)}" truncated="true">` +
-          `gap: events before this point may have been missed (truncated)</mcp_event_gap>`,
+        frameMcpTag(
+          "mcp_event_gap",
+          { server: delivery.server, name: delivery.name, truncated: true },
+          "gap: events before this point may have been missed (truncated)",
+        ),
       );
     }
     for (const occ of delivery.occurrences) {
       const full = JSON.stringify(occ.data ?? {}, null, 2);
       const truncated = truncateHead(full, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
-      let body = escapeXmlCloseTags(truncated.content);
+      let body = truncated.content;
       if (truncated.truncated) {
         try {
           const file = writePrivateTempFile("mcp-event", "json", full);
@@ -93,9 +83,17 @@ export function formatEventDeliveries(batch: EventDelivery[]): string {
         }
       }
       parts.push(
-        `<mcp_event server="${escapeAttr(delivery.server)}" name="${escapeAttr(occ.name ?? delivery.name)}" ` +
-          `event_id="${escapeAttr(occ.eventId)}" timestamp="${escapeAttr(occ.timestamp)}" truncated="${delivery.truncated ? "true" : "false"}">\n` +
-          `${body}\n</mcp_event>`,
+        frameMcpTag(
+          "mcp_event",
+          {
+            server: delivery.server,
+            name: occ.name ?? delivery.name,
+            event_id: occ.eventId,
+            timestamp: occ.timestamp,
+            truncated: delivery.truncated,
+          },
+          `\n${body}\n`,
+        ),
       );
     }
   }
@@ -225,7 +223,7 @@ export function createEventsEngine(
 
   function wakeNotice(sub: Sub, message: string): void {
     emitWake(
-      `<mcp_event_notice server="${escapeAttr(sub.record.server)}" name="${escapeAttr(sub.record.name)}">${escapeAttr(message)}</mcp_event_notice>`,
+      frameMcpTag("mcp_event_notice", { server: sub.record.server, name: sub.record.name }, escapeMcpAttr(message)),
       { deliveries: [], notice: message, server: sub.record.server, name: sub.record.name, subKey: sub.record.subKey },
     );
   }
@@ -311,31 +309,18 @@ export function createEventsEngine(
     client: ServerClient,
     opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
   ): Promise<EventDescriptor[]> {
-    const events: EventDescriptor[] = [];
-    const seenCursors = new Set<string>();
-    let cursor: string | undefined;
     const reqOpts = opts?.logLevel || opts?.onLog
       ? { ...(opts.logLevel ? { logLevel: opts.logLevel } : {}), ...(opts.onLog ? { onLog: opts.onLog } : {}) }
       : undefined;
-    for (let page = 0; page < 1_000; page++) {
-      const result = await client.request<ListEventsResult>(
-        "events/list",
-        cursor ? { cursor } : {},
-        reqOpts,
-      );
-      events.push(...(result.events ?? []));
-      const next = result.nextCursor;
-      if (!next) {
-        descriptorCache.set(server, events);
-        return events;
-      }
-      if (seenCursors.has(next)) {
-        throw new McpTransportError("protocol", `Duplicate pagination cursor on events/list for "${server}"`);
-      }
-      seenCursors.add(next);
-      cursor = next;
-    }
-    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on events/list for "${server}"`);
+    const events = await paginateMcp(
+      client,
+      "events/list",
+      page => (page as unknown as ListEventsResult).events ?? [],
+      {},
+      reqOpts,
+    );
+    descriptorCache.set(server, events);
+    return events;
   }
 
   async function list(

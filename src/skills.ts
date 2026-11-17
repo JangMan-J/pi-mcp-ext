@@ -13,8 +13,9 @@ import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs
 import { dirname, join, posix } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { canonicalJson } from "./events.ts";
+import { paginateMcp } from "./framing.ts";
 import { createPrivateSubdir } from "./temp-files.ts";
-import { CUSTOM_SKILL_APPROVALS, McpTransportError } from "./types.ts";
+import { CUSTOM_SKILL_APPROVALS } from "./types.ts";
 import type {
   EngineHost,
   JsonObject,
@@ -311,36 +312,26 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
 
   async function list(server: string, opts?: LogOpts): Promise<SkillEntry[]> {
     const client = requireSkillsClient(server);
-    const out: SkillEntry[] = [];
-    const seen = new Set<string>();
-    let cursor: string | undefined;
-    const reqOpts = toReqOpts(opts);
-    for (let page = 0; page < 1_000; page += 1) {
-      const res = await client.request<JsonObject>(
-        "skills/list",
-        cursor ? { cursor } : {},
-        reqOpts,
-      );
-      const rawSkills = Array.isArray(res.skills) ? res.skills : [];
-      for (const raw of rawSkills) {
-        try {
-          const entry = parseSkillEntry(raw);
-          retained.set(entryKey(server, entry.uri), entry);
-          out.push(entry);
-        } catch (err) {
-          host.log("warn", `[${server}] Skipping invalid MCP skill entry: ${err instanceof Error ? err.message : String(err)}`);
+    return paginateMcp(
+      client,
+      "skills/list",
+      (res) => {
+        const page: SkillEntry[] = [];
+        const rawSkills = Array.isArray(res.skills) ? res.skills : [];
+        for (const raw of rawSkills) {
+          try {
+            const entry = parseSkillEntry(raw);
+            retained.set(entryKey(server, entry.uri), entry);
+            page.push(entry);
+          } catch (err) {
+            host.log("warn", `[${server}] Skipping invalid MCP skill entry: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
-      }
-      if (typeof res.nextCursor !== "string" || !res.nextCursor) {
-        return out;
-      }
-      if (seen.has(res.nextCursor)) {
-        throw new McpTransportError("protocol", `Duplicate pagination cursor on skills/list for "${server}"`);
-      }
-      seen.add(res.nextCursor);
-      cursor = res.nextCursor;
-    }
-    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on skills/list for "${server}"`);
+        return page;
+      },
+      {},
+      toReqOpts(opts),
+    );
   }
 
   async function get(server: string, uri: string, opts?: LogOpts): Promise<SkillEntry> {

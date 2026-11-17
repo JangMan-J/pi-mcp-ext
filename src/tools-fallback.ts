@@ -10,12 +10,11 @@
  */
 
 import { createHash } from "node:crypto";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
-import { writePrivateTempFile } from "./temp-files.ts";
+import { convertMcpContentBlocks, paginateMcp, type ConvertedContent } from "./framing.ts";
 import { validateXMcpHeaders } from "./transport-http.ts";
-import { McpTransportError } from "./types.ts";
 import type {
   CreateTaskResult,
   EngineHost,
@@ -26,8 +25,6 @@ import type {
   ServerClient,
   TasksEngineApi,
 } from "./types.ts";
-
-const MAX_INLINE_TEXT_BYTES = 20 * 1024;
 
 interface McpToolDescriptor {
   name: string;
@@ -89,102 +86,12 @@ export function resolveEffectiveExposure(server: ResolvedServer, toolName: strin
   return server.exposure ?? "codemode";
 }
 
-function middleTruncateText(text: string): { text: string; fullOutputPath?: string } {
-  const bytes = Buffer.from(text, "utf8");
-  if (bytes.length <= MAX_INLINE_TEXT_BYTES) return { text };
-  const half = Math.floor(MAX_INLINE_TEXT_BYTES / 2);
-  const head = bytes.subarray(0, half).toString("utf8");
-  const tail = bytes.subarray(bytes.length - half).toString("utf8");
-  const removedChars = Math.max(1, text.length - head.length - tail.length);
-  try {
-    const file = writePrivateTempFile("mcp-tool", "txt", text);
-    return {
-      text: `${head}\n…${removedChars} chars truncated (full output saved to ${file})…\n${tail}`,
-      fullOutputPath: file,
-    };
-  } catch {
-    return { text: `${head}\n…${removedChars} chars truncated…\n${tail}` };
-  }
-}
-
+/** MCP tool-result content to Pi content (middle truncation); delegates to `convertMcpContentBlocks`. */
 export function convertToolContentBlocks(
   serverName: string,
   rawBlocks: readonly unknown[],
-): { content: Array<TextContent | ImageContent>; fullOutputPath?: string } {
-  const content: Array<TextContent | ImageContent> = [];
-  let savedPath: string | undefined;
-
-  for (const raw of rawBlocks) {
-    if (!isRecord(raw) || typeof raw.type !== "string") continue;
-    switch (raw.type) {
-      case "text": {
-        if (typeof raw.text === "string") {
-          const trunc = middleTruncateText(raw.text);
-          if (trunc.fullOutputPath && !savedPath) savedPath = trunc.fullOutputPath;
-          content.push({ type: "text", text: trunc.text });
-        }
-        break;
-      }
-      case "image": {
-        if (typeof raw.data === "string" && typeof raw.mimeType === "string") {
-          content.push({ type: "image", data: raw.data, mimeType: raw.mimeType });
-        }
-        break;
-      }
-      case "audio": {
-        if (typeof raw.data === "string") {
-          const mime = typeof raw.mimeType === "string" ? raw.mimeType : "audio/wav";
-          const ext = mime.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "wav";
-          try {
-            const file = writePrivateTempFile("mcp-audio", ext, Buffer.from(raw.data, "base64"));
-            content.push({ type: "text", text: `[Audio output (${mime}) saved to ${file}]` });
-          } catch {
-            content.push({ type: "text", text: `[Audio output (${mime})]` });
-          }
-        }
-        break;
-      }
-      case "resource_link": {
-        const uri = typeof raw.uri === "string" ? raw.uri : "";
-        const desc = typeof raw.description === "string" ? ` — ${raw.description}` : "";
-        content.push({
-          type: "text",
-          text: `[Resource link on MCP server "${serverName}": ${uri}${desc} (read via mcp_resources action="read")]`,
-        });
-        break;
-      }
-      case "resource": {
-        const res = isRecord(raw.resource) ? raw.resource : {};
-        const uri = typeof res.uri === "string" ? res.uri : "";
-        if (typeof res.text === "string") {
-          const trunc = middleTruncateText(res.text);
-          if (trunc.fullOutputPath && !savedPath) savedPath = trunc.fullOutputPath;
-          content.push({ type: "text", text: trunc.text });
-        } else if (typeof res.blob === "string") {
-          const mime = typeof res.mimeType === "string" ? res.mimeType : "application/octet-stream";
-          if (/^image\/(png|jpeg|jpg|gif|webp)$/i.test(mime)) {
-            content.push({ type: "image", data: res.blob, mimeType: mime });
-          } else {
-            try {
-              const file = writePrivateTempFile("mcp-blob", "bin", Buffer.from(res.blob, "base64"));
-              content.push({
-                type: "text",
-                text: `[Binary resource "${uri}" (${mime}) saved to ${file}]`,
-              });
-            } catch {
-              content.push({ type: "text", text: `[Binary resource "${uri}" (${mime})]` });
-            }
-          }
-        }
-        break;
-      }
-    }
-  }
-
-  if (content.length === 0) {
-    content.push({ type: "text", text: "" });
-  }
-  return { content, ...(savedPath ? { fullOutputPath: savedPath } : {}) };
+): ConvertedContent {
+  return convertMcpContentBlocks(serverName, rawBlocks, { truncate: "middle", tempPrefix: "mcp-tool" });
 }
 
 export function createToolsFallback(
@@ -232,11 +139,8 @@ export function createToolsFallback(
   }
 
   async function fetchServerTools(client: ServerClient): Promise<McpToolDescriptor[]> {
-    const out: McpToolDescriptor[] = [];
-    const seen = new Set<string>();
-    let cursor: string | undefined;
-    for (let page = 0; page < 1_000; page += 1) {
-      const res = await client.request<JsonObject>("tools/list", cursor ? { cursor } : {});
+    return paginateMcp(client, "tools/list", (res) => {
+      const out: McpToolDescriptor[] = [];
       const list = Array.isArray(res.tools) ? res.tools : [];
       for (const raw of list) {
         if (!isRecord(raw) || typeof raw.name !== "string") continue;
@@ -261,16 +165,8 @@ export function createToolsFallback(
             : {}),
         });
       }
-      if (typeof res.nextCursor !== "string" || !res.nextCursor) {
-        return out;
-      }
-      if (seen.has(res.nextCursor)) {
-        throw new McpTransportError("protocol", `Duplicate pagination cursor on tools/list for "${client.name}"`);
-      }
-      seen.add(res.nextCursor);
-      cursor = res.nextCursor;
-    }
-    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on tools/list for "${client.name}"`);
+      return out;
+    }, {});
   }
 
   function registerServerTools(

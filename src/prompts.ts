@@ -8,8 +8,8 @@
  */
 
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { writePrivateTempFile } from "./temp-files.ts";
-import { ErrorCode, McpRpcError, McpTransportError } from "./types.ts";
+import { convertMcpContentBlocks, frameMcpTag, paginateMcp } from "./framing.ts";
+import { ErrorCode, McpRpcError } from "./types.ts";
 import type {
   EngineHost,
   JSONRPCNotification,
@@ -76,19 +76,6 @@ export interface PromptsEngineApi {
 
 const COMPLETION_CACHE_MAX = 256;
 const COMPLETION_CACHE_TTL_MS = 15_000;
-
-function escapeAttr(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function escapeCloseTags(value: string): string {
-  return value.replace(/<\/(mcp_[a-zA-Z0-9_]*)/gi, "<\\/$1");
-}
 
 function isRecord(v: unknown): v is JsonObject {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -228,6 +215,20 @@ function renderPromptMessages(
 ): { renderedText: string; images: ImageContent[] } {
   const lines: string[] = [];
   const images: ImageContent[] = [];
+  const pushConverted = (block: JsonObject, prefix: string): void => {
+    const { content } = convertMcpContentBlocks(server, [block], {
+      truncate: "head",
+      tempPrefix: "mcp-prompt",
+    });
+    for (const item of content) {
+      if (item.type === "image") {
+        images.push(item);
+        if (prefix) lines.push(`${prefix}[Attached image (${item.mimeType})]`);
+      } else if (item.text) {
+        lines.push(`${prefix}${item.text}`);
+      }
+    }
+  };
 
   for (const msg of messages) {
     const prefix = msg.role === "assistant" ? "[Assistant context]\n" : "";
@@ -239,51 +240,21 @@ function renderPromptMessages(
         }
         break;
       }
-      case "image": {
-        if (typeof c.data === "string" && typeof c.mimeType === "string") {
-          images.push({ type: "image", data: c.data, mimeType: c.mimeType });
-          if (prefix) lines.push(`${prefix}[Attached image (${c.mimeType})]`);
-        }
-        break;
-      }
-      case "audio": {
-        if (typeof c.data === "string") {
-          const mime = typeof c.mimeType === "string" ? c.mimeType : "audio/wav";
-          const ext = mime.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "wav";
-          try {
-            const file = writePrivateTempFile("mcp-prompt-audio", ext, Buffer.from(c.data, "base64"));
-            lines.push(`${prefix}[Audio content (${mime}) saved to ${file}]`);
-          } catch {
-            lines.push(`${prefix}[Audio content (${mime})]`);
-          }
-        }
-        break;
-      }
-      case "resource_link": {
-        const uri = typeof c.uri === "string" ? c.uri : "";
-        const desc = typeof c.description === "string" ? ` — ${c.description}` : "";
-        lines.push(
-          `${prefix}[MCP resource link on "${server}": ${uri}${desc} (read with mcp_resources action="read")]`,
-        );
-        break;
-      }
       case "resource": {
         const res = isRecord(c.resource) ? c.resource : {};
-        const uri = typeof res.uri === "string" ? res.uri : "resource";
         if (typeof res.text === "string") {
-          lines.push(
-            `${prefix}<mcp_prompt_resource server="${escapeAttr(server)}" uri="${escapeAttr(uri)}">\n${escapeCloseTags(res.text)}\n</mcp_prompt_resource>`,
-          );
-        } else if (typeof res.blob === "string") {
-          const mime = typeof res.mimeType === "string" ? res.mimeType : "application/octet-stream";
-          if (/^image\/(png|jpeg|jpg|gif|webp)$/i.test(mime)) {
-            images.push({ type: "image", data: res.blob, mimeType: mime });
-          } else {
-            lines.push(`${prefix}[Embedded binary resource ${uri} (${mime})]`);
-          }
+          const uri = typeof res.uri === "string" ? res.uri : "resource";
+          lines.push(`${prefix}${frameMcpTag("mcp_prompt_resource", { server, uri }, `\n${res.text}\n`)}`);
+        } else {
+          pushConverted(c, prefix);
         }
         break;
       }
+      case "image":
+      case "audio":
+      case "resource_link":
+        pushConverted(c, prefix);
+        break;
       default:
         lines.push(`${prefix}${JSON.stringify(c)}`);
         break;
@@ -291,6 +262,32 @@ function renderPromptMessages(
   }
 
   return { renderedText: lines.join("\n\n"), images };
+}
+
+function parsePromptsPage(res: JsonObject): PromptDescriptor[] {
+  const page: PromptDescriptor[] = [];
+  const raw = Array.isArray(res.prompts) ? res.prompts : [];
+  for (const item of raw) {
+    if (!isRecord(item) || typeof item.name !== "string") continue;
+    const args = Array.isArray(item.arguments)
+      ? item.arguments
+          .filter(isRecord)
+          .filter((a) => typeof a.name === "string")
+          .map((a) => ({
+            name: a.name as string,
+            ...(typeof a.title === "string" ? { title: a.title } : {}),
+            ...(typeof a.description === "string" ? { description: a.description } : {}),
+            ...(typeof a.required === "boolean" ? { required: a.required } : {}),
+          }))
+      : undefined;
+    page.push({
+      name: item.name,
+      ...(typeof item.title === "string" ? { title: item.title } : {}),
+      ...(typeof item.description === "string" ? { description: item.description } : {}),
+      ...(args ? { arguments: args } : {}),
+    });
+  }
+  return page;
 }
 
 export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
@@ -344,49 +341,10 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
     client: ServerClient,
     opts?: LogOpts,
   ): Promise<PromptDescriptor[]> {
-    const out: PromptDescriptor[] = [];
-    const seen = new Set<string>();
-    let cursor: string | undefined;
-    const reqOpts = toReqOpts(opts);
-    for (let page = 0; page < 1_000; page += 1) {
-      const res = await client.request<JsonObject>(
-        "prompts/list",
-        cursor ? { cursor } : {},
-        reqOpts,
-      );
-      const raw = Array.isArray(res.prompts) ? res.prompts : [];
-      for (const item of raw) {
-        if (!isRecord(item) || typeof item.name !== "string") continue;
-        const args = Array.isArray(item.arguments)
-          ? item.arguments
-              .filter(isRecord)
-              .filter((a) => typeof a.name === "string")
-              .map((a) => ({
-                name: a.name as string,
-                ...(typeof a.title === "string" ? { title: a.title } : {}),
-                ...(typeof a.description === "string" ? { description: a.description } : {}),
-                ...(typeof a.required === "boolean" ? { required: a.required } : {}),
-              }))
-          : undefined;
-        out.push({
-          name: item.name,
-          ...(typeof item.title === "string" ? { title: item.title } : {}),
-          ...(typeof item.description === "string" ? { description: item.description } : {}),
-          ...(args ? { arguments: args } : {}),
-        });
-      }
-      if (typeof res.nextCursor !== "string" || !res.nextCursor) {
-        promptCache.set(server, out);
-        emitChanged(server, out);
-        return out;
-      }
-      if (seen.has(res.nextCursor)) {
-        throw new McpTransportError("protocol", `Duplicate pagination cursor on prompts/list for "${server}"`);
-      }
-      seen.add(res.nextCursor);
-      cursor = res.nextCursor;
-    }
-    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on prompts/list for "${server}"`);
+    const out = await paginateMcp(client, "prompts/list", parsePromptsPage, {}, toReqOpts(opts));
+    promptCache.set(server, out);
+    emitChanged(server, out);
+    return out;
   }
 
   async function list(server: string, opts?: LogOpts): Promise<PromptDescriptor[]> {
