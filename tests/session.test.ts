@@ -292,6 +292,17 @@ test("createMcpSession: restoreBranch restores pending tasks, holdsSettle tracks
     const pid = Number(readFileSync(h.pidFile, "utf8").trim());
     assert.ok(isPidAlive(pid));
 
+    // Headless settle hold: a pending task holds; an aborted ctx releases without waking the agent.
+    const abort = new AbortController();
+    const holding = session.settle({ ...h.ctx, signal: abort.signal, hasPendingMessages: () => false } as typeof h.ctx);
+    abort.abort();
+    assert.equal(await holding, false);
+    assert.equal(
+      await session.settle({ ...h.ctx, signal: undefined, hasPendingMessages: () => true } as typeof h.ctx),
+      false,
+      "pending messages mean the agent is already continuing",
+    );
+
     await session.shutdown(h.ctx);
     assert.equal(session.signal.aborted, true);
     assert.equal(session.holdsSettle(), false);

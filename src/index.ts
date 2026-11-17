@@ -25,11 +25,12 @@ import type {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type, type Static, type TUnsafe } from "typebox";
 
+import { mcpNamespace } from "./config.ts";
 import { parseSlashPromptInput, type PromptDescriptor } from "./prompts.ts";
 import {
   clearMcpStatus,
   createMcpSession,
-  normalizeServerCallError,
+  unknownServerError,
   type McpSession,
 } from "./session.ts";
 import { frameMcpTag } from "./framing.ts";
@@ -600,35 +601,36 @@ export default function extension(pi: ExtensionAPI): void {
     ctx: ExtensionCommandContext,
   ): Promise<void> {
     const session = requireActiveSession();
-    await session.requireServer({ server: serverName, capability: "prompts", ctx });
-    const descriptors = await session.prompts.list(serverName);
-    const descriptor = descriptors.find((d) => d.name === promptName);
-    const parsed = parseSlashPromptInput(rawArgs, descriptor?.arguments);
-    const resolvedArgs = { ...parsed.resolved };
+    await session.withServer({ server: serverName, capability: "prompts", ctx }, async () => {
+      const descriptors = await session.prompts.list(serverName);
+      const descriptor = descriptors.find((d) => d.name === promptName);
+      const parsed = parseSlashPromptInput(rawArgs, descriptor?.arguments);
+      const resolvedArgs = { ...parsed.resolved };
 
-    // Prompt interactively for any missing required arguments when UI is available.
-    if (ctx.hasUI && descriptor?.arguments) {
-      for (const argDef of descriptor.arguments) {
-        if (argDef.required && !(argDef.name in resolvedArgs)) {
-          const val = await ctx.ui.input(
-            `[${serverName}/${promptName}] ${argDef.title ?? argDef.name}${argDef.description ? ` — ${argDef.description}` : ""}`,
-            "Required argument",
-          );
-          if (val === undefined) return;
-          resolvedArgs[argDef.name] = val;
+      // Prompt interactively for any missing required arguments when UI is available.
+      if (ctx.hasUI && descriptor?.arguments) {
+        for (const argDef of descriptor.arguments) {
+          if (argDef.required && !(argDef.name in resolvedArgs)) {
+            const val = await ctx.ui.input(
+              `[${serverName}/${promptName}] ${argDef.title ?? argDef.name}${argDef.description ? ` — ${argDef.description}` : ""}`,
+              "Required argument",
+            );
+            if (val === undefined) return;
+            resolvedArgs[argDef.name] = val;
+          }
         }
       }
-    }
 
-    const promptRes = await session.prompts.get(serverName, promptName, resolvedArgs);
-    if (promptRes.images.length > 0) {
-      const blocks: Array<TextContent | ImageContent> = [];
-      if (promptRes.renderedText) blocks.push({ type: "text", text: promptRes.renderedText });
-      blocks.push(...promptRes.images);
-      pi.sendUserMessage(blocks);
-    } else {
-      pi.sendUserMessage(promptRes.renderedText || `Run prompt ${serverName}/${promptName}`);
-    }
+      const promptRes = await session.prompts.get(serverName, promptName, resolvedArgs);
+      if (promptRes.images.length > 0) {
+        const blocks: Array<TextContent | ImageContent> = [];
+        if (promptRes.renderedText) blocks.push({ type: "text", text: promptRes.renderedText });
+        blocks.push(...promptRes.images);
+        pi.sendUserMessage(blocks);
+      } else {
+        pi.sendUserMessage(promptRes.renderedText || `Run prompt ${serverName}/${promptName}`);
+      }
+    });
   }
 
   function ensurePerPromptCommand(serverName: string, prompt: PromptDescriptor): void {
@@ -732,8 +734,7 @@ export default function extension(pi: ExtensionAPI): void {
     },
     handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
       const session = requireActiveSession();
-      session.setContext(ctx);
-      await session.servers();
+      await session.servers(undefined, ctx);
 
       const trimmed = args.trim();
       if (!trimmed) {
@@ -795,27 +796,23 @@ export default function extension(pi: ExtensionAPI): void {
       _onUpdate: unknown,
       ctx: ExtensionToolContext,
     ): Promise<AgentToolResult<unknown>> {
-      if (currentSession && ctx) currentSession.setContext(ctx);
 
       switch (params.action) {
         case "servers": {
           const session = activeSession();
           if (!session) return jsonResult<ServerState[]>([]);
           const states = await session.servers(signal);
-          session.updateFooter(ctx);
           return jsonResult(states);
         }
 
         case "subscriptions": {
           const session = activeSession();
           if (!session) return jsonResult([]);
-          await session.waitForReload(signal);
-          await session.waitForActivations(signal);
+          await session.servers(signal, ctx);
           const all = session.events.subscriptions();
           const filtered = params.server
             ? all.filter((sub) => sub.server === params.server)
             : all;
-          session.updateFooter(ctx);
           return jsonResult(filtered);
         }
 
@@ -829,7 +826,6 @@ export default function extension(pi: ExtensionAPI): void {
             { server, capability: "events", logLevel: params.logLevel, signal, ctx },
             async ({ logOpts }) => {
               const list = await session.events.list(server, logOpts);
-              session.updateFooter(ctx);
               return list;
             },
           );
@@ -849,7 +845,7 @@ export default function extension(pi: ExtensionAPI): void {
           const { value } = await session.withServer(
             { server, capability: "events", signal, ctx },
             async () => {
-              const mode = ctx?.mode ?? session.latestCtx?.mode;
+              const mode = ctx?.mode;
               const defaultHoldSettle = mode === "print" || mode === "json";
               const req: SubscribeRequest = {
                 server,
@@ -861,7 +857,6 @@ export default function extension(pi: ExtensionAPI): void {
                 holdSettle: params.holdSettle ?? defaultHoldSettle,
               };
               const subscription = await session.events.subscribe(req);
-              session.updateFooter(ctx);
               return subscription;
             },
           );
@@ -876,29 +871,26 @@ export default function extension(pi: ExtensionAPI): void {
             throw new Error('mcp_events action "unsubscribe" requires parameter "name".');
           }
           const session = requireActiveSession();
-          await session.waitForReload(signal);
-          await session.waitForProbe(params.server, signal);
+          const states = await session.servers(signal, ctx);
           const hasPersisted = session.events
             .subscriptions()
             .some((sub) => sub.server === params.server);
-          if (!session.configuredServer(params.server) && !hasPersisted) {
-            throw session.unknownServerError(params.server);
-          }
-          try {
-            const removed = await session.events.unsubscribe(
+          if (!states.some((state) => state.name === params.server) && !hasPersisted) {
+            throw unknownServerError(
               params.server,
-              params.name,
-              params.arguments,
+              states.map((state) => state.name),
             );
-            session.updateFooter(ctx);
-            return jsonResult({
-              server: params.server,
-              name: params.name,
-              removed,
-            });
-          } catch (err) {
-            throw normalizeServerCallError(params.server, err);
           }
+          const removed = await session.events.unsubscribe(
+            params.server,
+            params.name,
+            params.arguments,
+          );
+          return jsonResult({
+            server: params.server,
+            name: params.name,
+            removed,
+          });
         }
 
         case "poll": {
@@ -921,7 +913,6 @@ export default function extension(pi: ExtensionAPI): void {
             { server, capability: "events", logLevel: params.logLevel, signal, ctx },
             async ({ logOpts }) => {
               const result = await session.events.poll(server, pollParams, logOpts);
-              session.updateFooter(ctx);
               return result;
             },
           );
@@ -945,7 +936,6 @@ export default function extension(pi: ExtensionAPI): void {
       _onUpdate: unknown,
       ctx: ExtensionToolContext,
     ): Promise<AgentToolResult<unknown>> {
-      if (currentSession && ctx) currentSession.setContext(ctx);
 
       switch (params.action) {
         case "active": {
@@ -955,7 +945,6 @@ export default function extension(pi: ExtensionAPI): void {
           const filtered = params.server
             ? active.filter((task) => task.server === params.server)
             : active;
-          session.updateFooter(ctx);
           return jsonResult(filtered);
         }
 
@@ -973,7 +962,6 @@ export default function extension(pi: ExtensionAPI): void {
             { server, capability: "tasks", logLevel: params.logLevel, signal, ctx },
             async ({ logOpts }) => {
               const outcome = await session.tasks.call(server, tool, params.arguments, signal, logOpts);
-              session.updateFooter(ctx);
               return outcome;
             },
           );
@@ -994,7 +982,6 @@ export default function extension(pi: ExtensionAPI): void {
             { server, capability: "tasks", logLevel: params.logLevel, signal, ctx },
             async ({ logOpts }) => {
               const task = await session.tasks.get(server, taskId, logOpts);
-              session.updateFooter(ctx);
               return task;
             },
           );
@@ -1021,7 +1008,6 @@ export default function extension(pi: ExtensionAPI): void {
             { server, capability: "tasks", logLevel: params.logLevel, signal, ctx },
             async ({ logOpts }) => {
               await session.tasks.update(server, taskId, inputResponses, logOpts);
-              session.updateFooter(ctx);
             },
           );
           return jsonResult({ server, taskId, updated: true }, logs);
@@ -1041,7 +1027,6 @@ export default function extension(pi: ExtensionAPI): void {
             { server, capability: "tasks", logLevel: params.logLevel, signal, ctx },
             async ({ logOpts }) => {
               await session.tasks.cancel(server, taskId, logOpts);
-              session.updateFooter(ctx);
             },
           );
           return jsonResult({ server, taskId, cancelled: true }, logs);
@@ -1064,13 +1049,11 @@ export default function extension(pi: ExtensionAPI): void {
       _onUpdate: unknown,
       ctx: ExtensionToolContext,
     ): Promise<AgentToolResult<unknown>> {
-      if (currentSession && ctx) currentSession.setContext(ctx);
 
       if (params.action === "subscriptions") {
         const session = activeSession();
         if (!session) return jsonResult([]);
         await session.servers(signal);
-        session.updateFooter(ctx);
         return jsonResult(session.resources.subscriptions(params.server));
       }
 
@@ -1085,7 +1068,6 @@ export default function extension(pi: ExtensionAPI): void {
           throw new Error('mcp_resources action "unsubscribe" requires parameter "uri".');
         }
         const removed = session.resources.unsubscribe(server, params.uri);
-        session.updateFooter(ctx);
         return jsonResult({ server, uri: params.uri, removed });
       }
 
@@ -1132,10 +1114,9 @@ export default function extension(pi: ExtensionAPI): void {
               if (!params.uri) {
                 throw new Error('mcp_resources action "subscribe" requires parameter "uri".');
               }
-              const mode = ctx?.mode ?? session.latestCtx?.mode;
+              const mode = ctx?.mode;
               const defaultHold = mode === "print" || mode === "json";
               const rec = session.resources.subscribe(server, params.uri, params.holdSettle ?? defaultHold);
-              session.updateFooter(ctx);
               return () => jsonResult(rec);
             }
           }
@@ -1159,7 +1140,6 @@ export default function extension(pi: ExtensionAPI): void {
       _onUpdate: unknown,
       ctx: ExtensionToolContext,
     ): Promise<AgentToolResult<unknown>> {
-      if (currentSession && ctx) currentSession.setContext(ctx);
       const session = requireActiveSession();
       const server = params.server;
       const logLevel = params.logLevel;
@@ -1259,7 +1239,6 @@ export default function extension(pi: ExtensionAPI): void {
       _onUpdate: unknown,
       ctx: ExtensionToolContext,
     ): Promise<AgentToolResult<unknown>> {
-      if (currentSession && ctx) currentSession.setContext(ctx);
       const session = requireActiveSession();
       const server = params.server;
 
@@ -1369,48 +1348,42 @@ export default function extension(pi: ExtensionAPI): void {
     const session = createMcpSession(pi, ctx);
     currentSession = session;
 
-    session.addCleanup(
-      session.prompts.onPromptsChanged((serverName, prompts) => {
-        for (const prompt of prompts) {
-          ensurePerPromptCommand(serverName, prompt);
-        }
-      }),
-    );
+    // Released when the session shuts down (the prompts engine drops its listeners).
+    session.prompts.onPromptsChanged((serverName, prompts) => {
+      for (const prompt of prompts) {
+        ensurePerPromptCommand(serverName, prompt);
+      }
+    });
 
-    session.restoreBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries());
-    session.updateFooter(ctx);
+    session.restoreBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries(), ctx);
 
     await session.reconcile({
       cwd: ctx.cwd,
       isProjectTrusted: ctx.isProjectTrusted(),
       sessionServers: toSessionServers(pi.getMcpServers()),
-    });
+    }, ctx);
   });
 
   pi.on("mcp_servers_change", async (event, ctx) => {
     const session = activeSession();
     if (!session) return;
-    session.setContext(ctx);
 
     await session.reconcile({
       cwd: ctx.cwd,
       isProjectTrusted: ctx.isProjectTrusted(),
       sessionServers: toSessionServers(event.servers ?? pi.getMcpServers()),
-    });
+    }, ctx);
   });
 
   pi.on("session_tree", (_event, ctx) => {
     const session = activeSession();
     if (!session) return;
-    session.setContext(ctx);
-    session.restoreBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries());
-    session.updateFooter(ctx);
+    session.restoreBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries(), ctx);
   });
 
   pi.on("tool_result", async (event: ToolResultEvent, ctx): Promise<ToolResultEventResult | undefined> => {
     const session = activeSession();
     if (!session) return undefined;
-    session.setContext(ctx);
 
     if (!event.isError || !event.toolName.startsWith("mcp__")) {
       return undefined;
@@ -1424,7 +1397,7 @@ export default function extension(pi: ExtensionAPI): void {
       return undefined;
     }
 
-    await session.waitForReload(ctx.signal);
+    const states = await session.servers(ctx.signal, ctx);
 
     let serverName: string | undefined;
     let toolName: string | undefined;
@@ -1438,8 +1411,8 @@ export default function extension(pi: ExtensionAPI): void {
       serverName = event.details.server;
       toolName = event.details.tool;
     } else {
-      const candidates = session
-        .configuredServers()
+      const candidates = states
+        .map((state) => ({ name: state.name, namespace: mcpNamespace(state.name) }))
         .filter(
           (cfg) =>
             event.toolName.startsWith(`${cfg.namespace}__`) &&
@@ -1455,9 +1428,7 @@ export default function extension(pi: ExtensionAPI): void {
 
     if (!serverName || !toolName) return undefined;
 
-    await session.waitForProbe(serverName, ctx.signal);
-
-    const state = session.clientState(serverName);
+    const state = states.find((candidate) => candidate.name === serverName);
     if (!state || state.era !== "modern" || !state.tasks) {
       return undefined;
     }
@@ -1506,70 +1477,7 @@ export default function extension(pi: ExtensionAPI): void {
 
       const session = activeSession();
       if (!session) return undefined;
-      session.setContext(ctx);
-
-      await session.waitForReload(ctx.signal);
-      await session.waitForActivations(ctx.signal);
-      if (ctx.signal?.aborted || session.signal.aborted) {
-        return undefined;
-      }
-
-      if (!session.holdsSettle() || ctx.hasPendingMessages()) {
-        return undefined;
-      }
-
-      const startWakeCount = session.wakeCount;
-
-      const outcome = await new Promise<"woke" | "drained" | "aborted">((resolve) => {
-        let settled = false;
-        let offWake: (() => void) | undefined;
-        let offSettle: (() => void) | undefined;
-        const abortCleanups: Array<() => void> = [];
-
-        const finish = (reason: "woke" | "drained" | "aborted") => {
-          if (settled) return;
-          settled = true;
-          offWake?.();
-          offSettle?.();
-          for (const cleanup of abortCleanups) cleanup();
-          resolve(reason);
-        };
-
-        const evaluate = () => {
-          if (session.signal.aborted || ctx.signal?.aborted) {
-            finish("aborted");
-            return;
-          }
-          if (session.wakeCount !== startWakeCount || ctx.hasPendingMessages()) {
-            finish("woke");
-            return;
-          }
-          if (!session.holdsSettle()) {
-            finish("drained");
-          }
-        };
-
-        offWake = session.onWake(() => finish("woke"));
-        offSettle = session.onSettleChange(evaluate);
-
-        for (const sig of [session.signal, ctx.signal]) {
-          if (!sig) continue;
-          if (sig.aborted) {
-            finish("aborted");
-            return;
-          }
-          const onAbort = () => finish("aborted");
-          sig.addEventListener("abort", onAbort, { once: true });
-          abortCleanups.push(() => sig.removeEventListener("abort", onAbort));
-        }
-
-        evaluate();
-      });
-
-      if (outcome === "woke") {
-        return { continue: true };
-      }
-      return undefined;
+      return (await session.settle(ctx)) ? { continue: true } : undefined;
     },
   );
 

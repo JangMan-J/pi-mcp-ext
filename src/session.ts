@@ -71,7 +71,7 @@ export interface ServerCallResult<T> {
 }
 
 /** A `subscribe` entry declared on a server in mcp.json. */
-export interface DeclaredSubscriptionItem {
+interface DeclaredSubscriptionItem {
   name: string;
   arguments?: JsonObject;
   delivery?: DeliveryPreference;
@@ -80,7 +80,7 @@ export interface DeclaredSubscriptionItem {
 }
 
 /** A resolved server plus its declarative event subscriptions. */
-export type ConfiguredServerEntry = ResolvedServer & {
+type ConfiguredServerEntry = ResolvedServer & {
   subscribe?: readonly DeclaredSubscriptionItem[];
 };
 
@@ -100,58 +100,39 @@ export interface McpSession {
    * normalizes needs-auth transport errors thrown by `fn`.
    */
   withServer<T>(req: ServerCallRequest, fn: (scope: ServerCallScope) => Promise<T>): Promise<ServerCallResult<T>>;
-  /** Load config and reconcile clients (serialized; removed/disabled/reconfigured servers are reaped). */
-  reconcile(options: ConfigLoadOptions): Promise<void>;
-  /** Restore engines from the active branch (and all entries for cursors/approvals). */
-  restoreBranch(branch: readonly unknown[], allEntries: readonly unknown[]): void;
-  /** Current state of every configured server, after pending reload and probes settle. */
-  servers(signal?: AbortSignal): Promise<ServerState[]>;
+  /**
+   * Load config and reconcile clients (serialized; removed/disabled/reconfigured servers are
+   * reaped). `ctx`, when given, becomes the session's latest Pi context.
+   */
+  reconcile(options: ConfigLoadOptions, ctx?: ExtensionContext): Promise<void>;
+  /** Restore engines from the active branch (and all entries for cursors/approvals), then refresh the footer. */
+  restoreBranch(branch: readonly unknown[], allEntries: readonly unknown[], ctx?: ExtensionContext): void;
+  /**
+   * Current state of every configured server, once pending reload, probes, and declarative
+   * subscription activations have settled (or `signal`/the session aborts). Refreshes the footer.
+   */
+  servers(signal?: AbortSignal, ctx?: ExtensionContext): Promise<ServerState[]>;
   /** True while any task is pending or any holdSettle subscription/watch is honored. */
   holdsSettle(): boolean;
+  /**
+   * Headless settle hold. When a task is pending or a holdSettle subscription/watch is honored,
+   * wait until a wake arrives (resolve `true`: the agent should continue), the holds drain, or
+   * `ctx.signal`/the session aborts (resolve `false`). Resolves `false` at once when nothing holds
+   * or `ctx` already has pending messages.
+   */
+  settle(ctx: ExtensionContext): Promise<boolean>;
   /** Flush pending wakes, abort, shut every engine and client down, and clean temp files. Idempotent. */
   shutdown(ctx?: ExtensionContext): Promise<void>;
-
-  // -------------------------------------------------------------------------------------------
-  // Wiring helpers for handlers that do not fit `withServer`.
-  // -------------------------------------------------------------------------------------------
-
-  /** Latest Pi context seen by this session (initially the `createMcpSession` context). */
-  readonly latestCtx: ExtensionContext | undefined;
-  /** Record the latest Pi context (UI availability, model registry, mode). */
-  setContext(ctx: ExtensionContext): void;
-  /**
-   * The checks of `withServer` without running anything: wait for reload and probe, then
-   * return the server's client or reject with the same user-facing errors.
-   */
-  requireServer(req: ServerCallRequest): Promise<ServerClient>;
-  /** Wait for the pending config reload chain (resolves early when `signal` or the session aborts). */
-  waitForReload(signal?: AbortSignal): Promise<void>;
-  /** Wait for one server's probe, if any (resolves early when `signal` or the session aborts). */
-  waitForProbe(server: string, signal?: AbortSignal): Promise<void>;
-  /** Wait for declarative-subscription activations (resolves early when `signal` or the session aborts). */
-  waitForActivations(signal?: AbortSignal): Promise<void>;
-  /** Configured server entry by name. */
-  configuredServer(name: string): ConfiguredServerEntry | undefined;
-  /** All configured server entries, in config order. */
-  configuredServers(): ConfiguredServerEntry[];
-  /** `Unknown MCP server "x". Configured servers: ...` error for `name`. */
-  unknownServerError(name: string): Error;
-  /** Current state of the server's client, if it has one. */
-  clientState(name: string): ServerState | undefined;
-  /** Refresh (or clear, once shut down) the footer status on `ctx` or the latest context. */
-  updateFooter(ctx?: ExtensionContext): void;
-  /** Number of wake messages sent so far. */
-  readonly wakeCount: number;
-  /** Listen for engine wakes; returns an unsubscribe function. */
-  onWake(listener: () => void): () => void;
-  /** Listen for wake/state changes relevant to settle holding; returns an unsubscribe function. */
-  onSettleChange(listener: () => void): () => void;
-  /** Register a cleanup run on shutdown (after abort, before engines shut down). */
-  addCleanup(cleanup: () => void): void;
 }
 
 /** Footer status key used by this extension. */
-export const STATUS_KEY = "mcp-ext";
+const STATUS_KEY = "mcp-ext";
+
+/** `Unknown MCP server "x". Configured servers: a, b.` (or `none`). */
+export function unknownServerError(name: string, configured: readonly string[]): Error {
+  const names = configured.length > 0 ? configured.join(", ") : "none";
+  return new Error(`Unknown MCP server "${name}". Configured servers: ${names}.`);
+}
 
 /** Clear this extension's footer status on `ctx` (no-op without UI). */
 export function clearMcpStatus(ctx?: ExtensionContext): void {
@@ -165,7 +146,7 @@ function errorMessage(error: unknown): string {
 }
 
 /** Format one request-scoped `notifications/message` entry as `[server/logger] (level) text`. */
-export function formatLogEntry(server: string, entry: McpLogMessage): string {
+function formatLogEntry(server: string, entry: McpLogMessage): string {
   const logger = entry.logger ? `/${entry.logger}` : "";
   const text = typeof entry.data === "string" ? entry.data : JSON.stringify(entry.data ?? {});
   return `[${server}${logger}] (${entry.level}) ${text}`;
@@ -217,7 +198,7 @@ function disabledServerState(server: ConfiguredServerEntry): ServerState {
 }
 
 /** Rewrite needs-auth transport failures into the user-facing sign-in hint. */
-export function normalizeServerCallError(serverName: string, err: unknown): Error {
+function normalizeServerCallError(serverName: string, err: unknown): Error {
   if (err instanceof McpTransportError && err.kind === "needs-auth") {
     return new Error(`MCP server "${serverName}" requires sign-in; run /mcp login ${serverName}`);
   }
@@ -401,15 +382,6 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
     }
   }
 
-  function configuredNamesList(): string {
-    const names = [...configuredServers.keys()];
-    return names.length > 0 ? names.join(", ") : "none";
-  }
-
-  function unknownServerError(name: string): Error {
-    return new Error(`Unknown MCP server "${name}". Configured servers: ${configuredNamesList()}.`);
-  }
-
   async function ensureModernCapability(
     serverName: string,
     capability: CapabilityKind | undefined,
@@ -422,7 +394,7 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
 
     const configured = configuredServers.get(serverName);
     if (!configured) {
-      throw unknownServerError(serverName);
+      throw unknownServerError(serverName, [...configuredServers.keys()]);
     }
     if (!configured.enabled) {
       throw new Error(`MCP server "${serverName}" is disabled.`);
@@ -827,10 +799,54 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
     await raceWithSignals(configLoadChain, [signal, controller.signal]);
   }
 
-  async function waitForProbes(signal?: AbortSignal): Promise<void> {
+  async function waitForProbesAndActivations(signal?: AbortSignal): Promise<void> {
     if (probePromises.size > 0) {
       await raceWithSignals(Promise.allSettled([...probePromises.values()]), [signal, controller.signal]);
     }
+    if (activationPromises.size > 0) {
+      await raceWithSignals(Promise.allSettled([...activationPromises.values()]), [signal, controller.signal]);
+    }
+  }
+
+  function settle(ctxArg: ExtensionContext): Promise<boolean> {
+    latestCtx = ctxArg;
+    return (async (): Promise<boolean> => {
+      await waitForReload(ctxArg.signal);
+      await waitForProbesAndActivations(ctxArg.signal);
+      if (ctxArg.signal?.aborted || controller.signal.aborted) return false;
+      if (!session.holdsSettle() || ctxArg.hasPendingMessages()) return false;
+
+      const startWakeCount = wakeCount;
+      return new Promise<boolean>((resolve) => {
+        let settled = false;
+        const offs: Array<() => void> = [];
+        const finish = (woke: boolean) => {
+          if (settled) return;
+          settled = true;
+          for (const off of offs) off();
+          resolve(woke);
+        };
+        const evaluate = () => {
+          if (controller.signal.aborted || ctxArg.signal?.aborted) return finish(false);
+          if (wakeCount !== startWakeCount || ctxArg.hasPendingMessages()) return finish(true);
+          if (!session.holdsSettle()) finish(false);
+        };
+
+        const onWake = () => finish(true);
+        wakeListeners.add(onWake);
+        offs.push(() => wakeListeners.delete(onWake));
+        settleListeners.add(evaluate);
+        offs.push(() => settleListeners.delete(evaluate));
+        for (const sig of [controller.signal, ctxArg.signal]) {
+          if (!sig) continue;
+          if (sig.aborted) return finish(false);
+          const onAbort = () => finish(false);
+          sig.addEventListener("abort", onAbort, { once: true });
+          offs.push(() => sig.removeEventListener("abort", onAbort));
+        }
+        evaluate();
+      });
+    })();
   }
 
   function shutdownSession(ctxArg?: ExtensionContext): Promise<void> {
@@ -903,36 +919,44 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
       req: ServerCallRequest,
       fn: (scope: ServerCallScope) => Promise<T>,
     ): Promise<ServerCallResult<T>> {
-      const client = await session.requireServer(req);
+      if (req.ctx) latestCtx = req.ctx;
+      const client = await ensureModernCapability(req.server, req.capability, req.signal);
       const collector = createLogCollector(req.server, req.logLevel);
       try {
         const value = await fn({ client, logOpts: collector.opts ?? {} });
         return { value, logs: collector.logs };
       } catch (err) {
         throw normalizeServerCallError(req.server, err);
+      } finally {
+        updateFooter(req.ctx);
       }
     },
 
-    reconcile(options: ConfigLoadOptions): Promise<void> {
+    reconcile(options: ConfigLoadOptions, ctxArg?: ExtensionContext): Promise<void> {
       cwd = options.cwd;
+      if (ctxArg) latestCtx = ctxArg;
       return queueConfigReload(options);
     },
 
-    restoreBranch(branch: readonly unknown[], allEntries: readonly unknown[]): void {
+    restoreBranch(branch: readonly unknown[], allEntries: readonly unknown[], ctxArg?: ExtensionContext): void {
+      if (ctxArg) latestCtx = ctxArg;
       events.restore(branch, allEntries);
       tasks.restore(branch);
       resources.restore(branch);
       skills.restore(allEntries);
+      updateFooter(ctxArg);
     },
 
-    async servers(signal?: AbortSignal): Promise<ServerState[]> {
+    async servers(signal?: AbortSignal, ctxArg?: ExtensionContext): Promise<ServerState[]> {
+      if (ctxArg) latestCtx = ctxArg;
       await waitForReload(signal);
-      await waitForProbes(signal);
+      await waitForProbesAndActivations(signal);
       const states: ServerState[] = [];
       for (const [name, cfg] of configuredServers) {
         const client = clients.get(name);
         states.push(client ? { ...client.state } : disabledServerState(cfg));
       }
+      updateFooter(ctxArg);
       return states;
     },
 
@@ -940,77 +964,10 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
       return tasks.hasPending() || events.holdsSettle() || resources.holdsSettle();
     },
 
+    settle,
+
     shutdown(ctxArg?: ExtensionContext): Promise<void> {
       return shutdownSession(ctxArg);
-    },
-
-    get latestCtx(): ExtensionContext | undefined {
-      return latestCtx;
-    },
-
-    setContext(next: ExtensionContext): void {
-      latestCtx = next;
-    },
-
-    requireServer(req: ServerCallRequest): Promise<ServerClient> {
-      if (req.ctx) latestCtx = req.ctx;
-      return ensureModernCapability(req.server, req.capability, req.signal);
-    },
-
-    waitForReload,
-
-    async waitForProbe(server: string, signal?: AbortSignal): Promise<void> {
-      const probe = probePromises.get(server);
-      if (probe) {
-        await raceWithSignals(probe, [signal, controller.signal]);
-      }
-    },
-
-    async waitForActivations(signal?: AbortSignal): Promise<void> {
-      if (activationPromises.size > 0) {
-        await raceWithSignals(
-          Promise.allSettled([...activationPromises.values()]),
-          [signal, controller.signal],
-        );
-      }
-    },
-
-    configuredServer(name: string): ConfiguredServerEntry | undefined {
-      return configuredServers.get(name);
-    },
-
-    configuredServers(): ConfiguredServerEntry[] {
-      return [...configuredServers.values()];
-    },
-
-    unknownServerError,
-
-    clientState(name: string): ServerState | undefined {
-      return clients.get(name)?.state;
-    },
-
-    updateFooter,
-
-    get wakeCount(): number {
-      return wakeCount;
-    },
-
-    onWake(listener: () => void): () => void {
-      wakeListeners.add(listener);
-      return () => {
-        wakeListeners.delete(listener);
-      };
-    },
-
-    onSettleChange(listener: () => void): () => void {
-      settleListeners.add(listener);
-      return () => {
-        settleListeners.delete(listener);
-      };
-    },
-
-    addCleanup(cleanup: () => void): void {
-      cleanups.push(cleanup);
     },
   };
 

@@ -501,6 +501,7 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
     inflightLists.clear();
     inflightCompletions.clear();
     completionCache.clear();
+    changeListeners.clear();
   }
 
   return {
