@@ -35,7 +35,7 @@ function state(): ServerState {
   return {
     name: "x",
     transport: "stdio",
-    era: "2026-07-28",
+    era: "modern",
     events: false,
     eventsListChanged: false,
     tasks: false,
