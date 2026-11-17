@@ -801,7 +801,7 @@ export default function extension(pi: ExtensionAPI): void {
         case "servers": {
           const session = activeSession();
           if (!session) return jsonResult<ServerState[]>([]);
-          const states = await session.servers(signal);
+          const states = await session.servers(signal, ctx);
           return jsonResult(states);
         }
 
@@ -1053,7 +1053,7 @@ export default function extension(pi: ExtensionAPI): void {
       if (params.action === "subscriptions") {
         const session = activeSession();
         if (!session) return jsonResult([]);
-        await session.servers(signal);
+        await session.servers(signal, ctx);
         return jsonResult(session.resources.subscriptions(params.server));
       }
 

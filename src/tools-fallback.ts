@@ -110,32 +110,23 @@ export function createToolsFallback(
   const onAbort = () => void shutdown();
   host.signal?.addEventListener?.("abort", onAbort, { once: true });
 
-  function builtinLoaded(): boolean {
-    return pi.getAllTools().some((t) => t.sourceInfo?.path === "builtin:mcp");
-  }
-
-  function builtinOwnsServer(serverName: string, namespace: string, client?: ServerClient): boolean {
-    if (
-      client?.state.supportedVersions?.some((v) => v < "2026-07-28") &&
-      builtinLoaded()
-    ) {
-      return true;
-    }
-    const sanitizedPrefix = `mcp__${sanitizeSegment(serverName)}__`;
+  function builtinOwnsServer(serverName: string, namespace: string): boolean {
+    const prefix = `mcp__${sanitizeSegment(serverName)}__`;
     const nsPrefix = `${namespace}__`;
     const ownNames = new Set<string>();
     for (const set of serverRegisteredNames.values()) {
       for (const n of set) ownNames.add(n);
     }
-    return pi.getAllTools().some(
-      (t) =>
-        !ownNames.has(t.name) &&
-        (t.name.startsWith(nsPrefix) ||
-          t.name.startsWith(sanitizedPrefix) ||
-          (t.sourceInfo?.path === "builtin:mcp" &&
-            t.name.startsWith("mcp__") &&
-            sanitizedPrefix.startsWith(t.name.slice(0, Math.min(sanitizedPrefix.length, 40))))),
-    );
+    const belongs = (name: string): boolean => {
+      if (name.startsWith(prefix) || name.startsWith(nsPrefix)) return true;
+      // Pi shortens names past 64 chars to 55 chars, "_", then 8 hex digits.
+      if (name.length === 64 && name[55] === "_") {
+        const stem = name.slice(0, 55);
+        return stem.startsWith(prefix) || prefix.startsWith(stem);
+      }
+      return false;
+    };
+    return pi.getAllTools().some((t) => !ownNames.has(t.name) && belongs(t.name));
   }
 
   async function fetchServerTools(client: ServerClient): Promise<McpToolDescriptor[]> {
@@ -175,7 +166,7 @@ export function createToolsFallback(
     tools: readonly McpToolDescriptor[],
   ): void {
     if (shutDown) return;
-    if (builtinOwnsServer(server.name, server.namespace, client)) return;
+    if (builtinOwnsServer(server.name, server.namespace)) return;
 
     const previous = serverRegisteredNames.get(server.name) ?? new Set<string>();
     const current = new Set<string>();
@@ -303,7 +294,7 @@ export function createToolsFallback(
     const server = serverConfigs.get(serverName);
     const client = host.getClient(serverName);
     if (!server || !client || !client.state.tools) return;
-    if (builtinOwnsServer(server.name, server.namespace, client)) {
+    if (builtinOwnsServer(server.name, server.namespace)) {
       deactivateServer(serverName);
       return;
     }
@@ -318,20 +309,20 @@ export function createToolsFallback(
     if (!client || !client.state.tools) return false;
     serverConfigs.set(server.name, server);
 
-    if (builtinOwnsServer(server.name, server.namespace, client)) return false;
+    if (builtinOwnsServer(server.name, server.namespace)) return false;
     if (settleMs > 0) {
       await new Promise<void>((resolve) => {
         const t = setTimeout(resolve, settleMs);
         t.unref?.();
       });
     }
-    if (shutDown || builtinOwnsServer(server.name, server.namespace, client)) return false;
+    if (shutDown || builtinOwnsServer(server.name, server.namespace)) return false;
 
     const liveClient = host.getClient(server.name);
     if (!liveClient) return false;
 
     const tools = await fetchServerTools(liveClient);
-    if (shutDown || builtinOwnsServer(server.name, server.namespace, liveClient)) return false;
+    if (shutDown || builtinOwnsServer(server.name, server.namespace)) return false;
 
     registerServerTools(server, liveClient, tools);
 
