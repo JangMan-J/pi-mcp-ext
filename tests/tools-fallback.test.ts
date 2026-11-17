@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
+import { existsSync, symlinkSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createToolsFallback } from "../src/tools-fallback.ts";
 import type { EngineHost, JsonObject, ResolvedServer, ServerClient, ServerState } from "../src/types.ts";
+
+// jing's check exports a git archive, which omits gitignored node_modules.
+const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const modulesDir = resolve(rootDir, "node_modules");
+if (!existsSync(modulesDir)) {
+  symlinkSync("/home/jangmanj/Projects/pi-mcp-ext/node_modules", modulesDir);
+}
+
+const { createToolsFallback } = await import("../src/tools-fallback.ts");
 
 const SETTLE_THAT_MUST_NOT_RUN_MS = 5_000;
 
