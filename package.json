@@ -1,6 +1,6 @@
 {
   "name": "@jangmanj/pi-mcp-ext",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP 2026-07-28 events and tasks for Pi, alongside builtin:mcp",
   "license": "MIT",
   "author": "JangMan-J",
