@@ -15,6 +15,7 @@ export const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilit
 export const META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo";
 export const META_SERVER_INFO = "io.modelcontextprotocol/serverInfo";
 export const META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId";
+export const META_LOG_LEVEL = "io.modelcontextprotocol/logLevel";
 export const CLIENT_INFO = { name: "pi-mcp-ext", version: "0.1.0" } as const;
 
 /** JSON-RPC and MCP error codes this package acts on. */
@@ -167,8 +168,33 @@ export interface DiscoverResult {
 /** Filter of `subscriptions/listen` and of its acknowledgment. False/empty fields are omitted on the wire. */
 export interface ListenFilter {
   eventsListChanged?: boolean;
+  toolsListChanged?: boolean;
+  promptsListChanged?: boolean;
+  resourcesListChanged?: boolean;
+  resourceSubscriptions?: string[];
   taskIds?: string[];
 }
+
+export interface ServerCard {
+  name?: string;
+  version?: string;
+  description?: string;
+  title?: string;
+  protocolVersions?: string[];
+  supportedProtocolVersions?: string[];
+  transports?: unknown;
+  [key: string]: unknown;
+}
+
+export type McpLogLevel =
+  | "debug"
+  | "info"
+  | "notice"
+  | "warning"
+  | "error"
+  | "critical"
+  | "alert"
+  | "emergency";
 
 // ---------------------------------------------------------------------------------------------
 // SEP-3415 events
@@ -189,6 +215,8 @@ export interface ListEventsResult {
   resultType: "complete";
   events: EventDescriptor[];
   nextCursor?: string;
+  ttlMs?: number;
+  cacheScope?: "public" | "private";
 }
 
 export interface EventOccurrence {
@@ -406,6 +434,7 @@ export interface ServerState {
   tasks: boolean;
   serverInfo?: Implementation;
   instructions?: string;
+  serverCard?: ServerCard;
 }
 
 export interface ClientRequestOptions {
@@ -415,6 +444,8 @@ export interface ClientRequestOptions {
   onNotification?: (msg: JSONRPCNotification) => void;
   /** HTTP only: extra headers (Mcp-Param-*). */
   headers?: Record<string, string>;
+  /** SEP-2575 per-request log level (`io.modelcontextprotocol/logLevel`). */
+  logLevel?: McpLogLevel;
 }
 
 /** Interest a module registers in the server's single `subscriptions/listen` stream. */
@@ -439,6 +470,8 @@ export interface ServerClient {
     onNotification: (msg: JSONRPCNotification) => void,
     opts?: { signal?: AbortSignal; headers?: Record<string, string> },
   ): Promise<OpenStreamHandle>;
+  /** Fetch SEP-2127 Server Card for HTTP servers when available. */
+  discoverCard?(): Promise<ServerCard | undefined>;
   /**
    * Set one owner's share of the `subscriptions/listen` filter. The client unions all owners, holds at
    * most one stream, replaces it atomically when the union changes, and closes it when the union is empty.
@@ -561,8 +594,14 @@ export interface EventsEngineApi {
 export interface TasksEngineApi {
   restore(allEntries: readonly unknown[]): void;
   serverReady(server: string): void;
-  /** `tools/call` with tasks in _meta; tracks a returned task. Returns the raw outcome. */
-  call(server: string, tool: string, args?: JsonObject, signal?: AbortSignal): Promise<ToolCallOutcome>;
+  /** `tools/call` with tasks and MRTR (`inputResponses` / `requestState`) support. */
+  call(
+    server: string,
+    tool: string,
+    args?: JsonObject,
+    signal?: AbortSignal,
+    mrtr?: { inputResponses?: JsonObject; requestState?: string },
+  ): Promise<ToolCallOutcome>;
   get(server: string, taskId: string): Promise<DetailedTask>;
   update(server: string, taskId: string, inputResponses: JsonObject): Promise<void>;
   cancel(server: string, taskId: string): Promise<void>;

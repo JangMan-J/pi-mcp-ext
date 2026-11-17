@@ -5,6 +5,7 @@ import {
   EXT_TASKS,
   META_CLIENT_CAPABILITIES,
   META_CLIENT_INFO,
+  META_LOG_LEVEL,
   META_PROTOCOL_VERSION,
   META_SERVER_INFO,
   McpRpcError,
@@ -25,9 +26,11 @@ import type {
   ListenFilter,
   ListenOwner,
   Mcp2026Transport,
+  McpLogLevel,
   OpenStreamHandle,
   RequestId,
   ResolvedServer,
+  ServerCard,
   ServerClient,
   ServerState,
 } from "./types.ts";
@@ -81,6 +84,11 @@ function errorMessage(error: unknown): string {
 function normalizeFilter(filter: ListenFilter): ListenFilter {
   const normalized: ListenFilter = {};
   if (filter.eventsListChanged === true) normalized.eventsListChanged = true;
+  if (filter.toolsListChanged === true) normalized.toolsListChanged = true;
+  if (filter.promptsListChanged === true) normalized.promptsListChanged = true;
+  if (filter.resourcesListChanged === true) normalized.resourcesListChanged = true;
+  const resourceSubscriptions = [...new Set(filter.resourceSubscriptions ?? [])];
+  if (resourceSubscriptions.length) normalized.resourceSubscriptions = resourceSubscriptions;
   const taskIds = [...new Set(filter.taskIds ?? [])];
   if (taskIds.length) normalized.taskIds = taskIds;
   return normalized;
@@ -143,9 +151,16 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     return `${prefix}-${sequence}`;
   }
 
-  function requestMessage(method: string, params?: JsonObject, id: RequestId = nextId("request")): JSONRPCRequest {
+  function requestMessage(
+    method: string,
+    params?: JsonObject,
+    id: RequestId = nextId("request"),
+    logLevel?: McpLogLevel,
+  ): JSONRPCRequest {
     const requestParams: JsonObject = { ...params };
-    requestParams._meta = { ...(params?._meta as JsonObject | undefined), ...makeMeta() };
+    const meta: JsonObject = { ...(params?._meta as JsonObject | undefined), ...makeMeta() };
+    if (logLevel !== undefined) meta[META_LOG_LEVEL] = logLevel;
+    requestParams._meta = meta;
     return { jsonrpc: "2.0", id, method, params: requestParams };
   }
 
@@ -215,27 +230,36 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     opts?: ClientRequestOptions,
   ): Promise<T> {
     const transport = await getTransport();
-    const response = await transport.request(requestMessage(method, params), {
-      signal: opts?.signal,
-      timeoutMs: opts?.timeoutMs ?? config.timeoutMs,
-      onNotification: opts?.onNotification,
-      headers: opts?.headers,
-    });
+    const response = await transport.request(
+      requestMessage(method, params, nextId("request"), opts?.logLevel),
+      {
+        signal: opts?.signal,
+        timeoutMs: opts?.timeoutMs ?? config.timeoutMs,
+        onNotification: opts?.onNotification,
+        headers: opts?.headers,
+      },
+    );
     if (isErrorResponse(response)) throw new McpRpcError(response.error);
     return response.result as T;
   }
 
   const toolHeaders = new Map<string, HeaderDescriptor[]>();
+  let toolHeadersExpiresAt = 0;
   let toolHeaderListing: Promise<void> | undefined;
 
-  async function cacheToolHeaders(): Promise<void> {
-    if (toolHeaderListing) return toolHeaderListing;
+  async function cacheToolHeaders(force = false): Promise<void> {
+    if (!force && toolHeaderListing) return toolHeaderListing;
     toolHeaderListing = (async () => {
       const { collectXMcpHeaders } = await import("./transport-http.ts");
+      toolHeaders.clear();
+      let minTtlMs: number | undefined;
       let cursor: string | undefined;
       const seen = new Set<string>();
       for (let page = 0; page < 32; page += 1) {
         const result = await rawRequest<JsonObject>("tools/list", cursor ? { cursor } : undefined);
+        if (typeof result.ttlMs === "number" && Number.isFinite(result.ttlMs) && result.ttlMs >= 0) {
+          minTtlMs = minTtlMs === undefined ? result.ttlMs : Math.min(minTtlMs, result.ttlMs);
+        }
         if (Array.isArray(result.tools)) {
           for (const tool of result.tools) {
             if (typeof tool !== "object" || tool === null) continue;
@@ -249,7 +273,10 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
         seen.add(result.nextCursor);
         cursor = result.nextCursor;
       }
-    })();
+      toolHeadersExpiresAt = minTtlMs && minTtlMs > 0 ? Date.now() + minTtlMs : Infinity;
+    })().finally(() => {
+      toolHeaderListing = undefined;
+    });
     return toolHeaderListing;
   }
 
@@ -259,6 +286,9 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     supplied: Record<string, string> | undefined,
   ): Promise<Record<string, string> | undefined> {
     if (config.transport !== "http" || method !== "tools/call" || typeof params?.name !== "string") return supplied;
+    if (Date.now() >= toolHeadersExpiresAt && toolHeaders.size > 0) {
+      await cacheToolHeaders(true).catch(() => {});
+    }
     const descriptors = toolHeaders.get(params.name);
     if (!descriptors) return supplied;
     const { paramHeaders } = await import("./transport-http.ts");
@@ -277,7 +307,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     } catch (error) {
       if (config.transport !== "http" || method !== "tools/call"
         || !(error instanceof McpRpcError) || error.code !== ErrorCode.HeaderMismatch) throw error;
-      await cacheToolHeaders();
+      await cacheToolHeaders(true);
       const { paramHeaders } = await import("./transport-http.ts");
       const descriptors = typeof params?.name === "string" ? toolHeaders.get(params.name) ?? [] : [];
       const args = typeof params?.arguments === "object" && params.arguments !== null ? params.arguments : {};
@@ -449,6 +479,10 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       return;
     }
     if (msg.method === "notifications/subscriptions/acknowledged") return;
+    if (msg.method === "notifications/tools/list_changed") {
+      toolHeaders.clear();
+      toolHeadersExpiresAt = 0;
+    }
     for (const listener of [...notificationListeners]) listener(msg);
   }
 
@@ -490,10 +524,24 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
 
   function unionFilters(): ListenFilter {
     let eventsListChanged = false;
+    let toolsListChanged = false;
+    let promptsListChanged = false;
+    let resourcesListChanged = false;
+    const resourceSubscriptions: string[] = [];
+    const seenRes = new Set<string>();
     const taskIds: string[] = [];
     const seen = new Set<string>();
     for (const filter of owners.values()) {
       eventsListChanged ||= filter.eventsListChanged === true;
+      toolsListChanged ||= filter.toolsListChanged === true;
+      promptsListChanged ||= filter.promptsListChanged === true;
+      resourcesListChanged ||= filter.resourcesListChanged === true;
+      for (const uri of filter.resourceSubscriptions ?? []) {
+        if (!seenRes.has(uri)) {
+          seenRes.add(uri);
+          resourceSubscriptions.push(uri);
+        }
+      }
       for (const taskId of filter.taskIds ?? []) {
         if (!seen.has(taskId)) {
           seen.add(taskId);
@@ -501,7 +549,14 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
         }
       }
     }
-    return normalizeFilter({ eventsListChanged, taskIds });
+    return normalizeFilter({
+      eventsListChanged,
+      toolsListChanged,
+      promptsListChanged,
+      resourcesListChanged,
+      resourceSubscriptions,
+      taskIds,
+    });
   }
 
   function setListenInterest(owner: ListenOwner, filter: ListenFilter): void {
@@ -561,11 +616,36 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     return closePromise;
   }
 
+  async function discoverCard(): Promise<ServerCard | undefined> {
+    if (config.transport !== "http") return undefined;
+    const baseUrl = new URL(config.url);
+    const trimmedPath = baseUrl.pathname.replace(/\/+$/, "");
+    const candidates = [
+      new URL(`${trimmedPath}/server-card`, baseUrl.origin).toString(),
+      new URL("/.well-known/mcp/server-card.json", baseUrl.origin).toString(),
+    ];
+    for (const cardUrl of candidates) {
+      try {
+        const res = await fetch(cardUrl, { headers: { Accept: "application/json" } });
+        if (!res.ok) continue;
+        const parsed = (await res.json()) as unknown;
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          state.serverCard = parsed as ServerCard;
+          return state.serverCard;
+        }
+      } catch {
+        // optional discovery path
+      }
+    }
+    return undefined;
+  }
+
   return {
     name: config.name,
     config,
     state,
     discover,
+    discoverCard,
     request,
     openStream,
     setListenInterest,

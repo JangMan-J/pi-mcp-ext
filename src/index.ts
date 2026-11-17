@@ -175,7 +175,12 @@ const McpTasksParams = Type.Object(
     ),
     inputResponses: Type.Optional(
       Type.Record(Type.String(), Type.Unknown(), {
-        description: "Responses keyed by inputRequests identifier (required for update).",
+        description: "Responses keyed by inputRequests identifier (for action 'update' or MRTR retry on 'call').",
+      }),
+    ),
+    requestState: Type.Optional(
+      Type.String({
+        description: "Opaque requestState token returned by an input_required response (for MRTR retry on 'call').",
       }),
     ),
   },
@@ -1224,8 +1229,24 @@ export default function extension(pi: ExtensionAPI): void {
               params.tool,
               params.arguments,
               signal,
+              params.inputResponses !== undefined || params.requestState !== undefined
+                ? {
+                    ...(params.inputResponses !== undefined
+                      ? { inputResponses: params.inputResponses }
+                      : {}),
+                    ...(params.requestState !== undefined
+                      ? { requestState: params.requestState }
+                      : {}),
+                  }
+                : undefined,
             );
             updateFooter(session, ctx);
+            if ("resultType" in outcome && outcome.resultType === "input_required") {
+              return jsonResult({
+                ...outcome,
+                mrtrHint: "Retry mcp_tasks action 'call' with inputResponses (and requestState if present).",
+              });
+            }
             return jsonResult(outcome);
           } catch (err) {
             throw normalizeServerCallError(params.server, err);

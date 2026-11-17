@@ -151,7 +151,7 @@ export function createEventsEngine(
   const checkpointMs = opts?.checkpointMs ?? 30000;
 
   const subs = new Map<string, Sub>();
-  const descriptorCache = new Map<string, EventDescriptor[]>();
+  const descriptorCache = new Map<string, { events: EventDescriptor[]; expiresAt: number }>();
   /** Newest non-null cursor per subKey, from restored entries. */
   const persistedCursors = new Map<string, string>();
   /** Newest recentEventIds per subKey, from restored entries. */
@@ -285,16 +285,21 @@ export function createEventsEngine(
     ensureListen(server, client);
     const events: EventDescriptor[] = [];
     const seenCursors = new Set<string>();
+    let minTtlMs: number | undefined;
     let cursor: string | undefined;
     for (let page = 0; page < 32; page++) {
       const result = await client.request<ListEventsResult>("events/list", cursor ? { cursor } : {});
+      if (typeof result.ttlMs === "number" && Number.isFinite(result.ttlMs) && result.ttlMs >= 0) {
+        minTtlMs = minTtlMs === undefined ? result.ttlMs : Math.min(minTtlMs, result.ttlMs);
+      }
       events.push(...(result.events ?? []));
       const next = result.nextCursor;
       if (!next || seenCursors.has(next)) break;
       seenCursors.add(next);
       cursor = next;
     }
-    descriptorCache.set(server, events);
+    const expiresAt = minTtlMs === undefined ? Infinity : minTtlMs > 0 ? Date.now() + minTtlMs : 0;
+    descriptorCache.set(server, { events, expiresAt });
     return events;
   }
 
@@ -614,7 +619,11 @@ export function createEventsEngine(
     sub.startPromise = (async () => {
       try {
         ensureListen(sub.record.server, client);
-        const descriptors = descriptorCache.get(sub.record.server) ?? (await list(sub.record.server));
+        const cached = descriptorCache.get(sub.record.server);
+        const descriptors =
+          cached && Date.now() < cached.expiresAt
+            ? cached.events
+            : await list(sub.record.server);
         const descriptor = descriptors.find(d => d.name === sub.record.name);
         if (!descriptor) {
           host.log("warn", `event "${sub.record.name}" not found in events/list for ${sub.record.server}; subscription not started`);
