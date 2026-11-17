@@ -1,15 +1,18 @@
 /**
  * Pure `2026-07-28` Tools Fallback (`specification/2026-07-28/server/tools.md`).
  *
- * `builtin:mcp` hardcodes `2025-11-25` `initialize`. When a server speaks pure `2026-07-28`
- * (answering `server/discover` with `capabilities.tools`, while `builtin:mcp` failed to register
- * `mcp__<server>__*`), this module lists and registers `mcp__<server>__<tool>` with full
- * `exposure` / `toolExposure` parity and refreshes dynamically via `toolsListChanged` on
- * `subscriptions/listen`. On dual-stack servers where `builtin:mcp` already registered tools,
- * this module stands down completely.
+ * `builtin:mcp` hardcodes `2025-11-25` `initialize`. Builtin is active when `pi.getCommands()`
+ * includes `mcp` (`/mcp`). It is disabled when `settings.extensions` contains `-builtin:mcp` or
+ * `!builtin:mcp` (there is no extension flag for `--no-mcp`; Pi simply does not register `/mcp`).
+ * Otherwise builtin is absent.
+ *
+ * While builtin is active this module registers nothing, even if `mcp__<server>__*` tools are
+ * missing now and appear later. There is no settle delay. When builtin is absent or disabled,
+ * and it does not already own `mcp__<server>__*` (including Pi's 64-character shortened names),
+ * this module lists and registers `mcp__<server>__<tool>` with full `exposure` / `toolExposure`
+ * parity and refreshes dynamically via `toolsListChanged` on `subscriptions/listen`.
  */
 
-import { backgroundTimer } from "./timer.ts";
 import { createHash } from "node:crypto";
 import type { TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -98,9 +101,12 @@ export function convertToolContentBlocks(
 export function createToolsFallback(
   pi: ExtensionAPI,
   host: EngineHost,
-  opts?: { builtinSettleMs?: number; tasks?: TasksEngineApi },
+  opts?: {
+    /** @deprecated Ignored. Builtin presence is `/mcp` and settings, not a settle delay. */
+    builtinSettleMs?: number;
+    tasks?: TasksEngineApi;
+  },
 ): ToolsFallbackApi {
-  const settleMs = opts?.builtinSettleMs ?? 120;
   const toolOwners = new Map<string, string>();
   const serverRegisteredNames = new Map<string, Set<string>>();
   const serverConfigs = new Map<string, ResolvedServer>();
@@ -110,6 +116,22 @@ export function createToolsFallback(
 
   const onAbort = () => void shutdown();
   host.signal?.addEventListener?.("abort", onAbort, { once: true });
+
+  /** `active` if `/mcp` is registered; `disabled` if settings turn builtin off; else `absent`. */
+  function builtinMcpDisposition(): "active" | "disabled" | "absent" {
+    if (pi.getCommands().some((command) => command.name === "mcp")) return "active";
+    const extensions = pi.getSettings().extensions;
+    if (
+      extensions?.some((entry) => entry === "-builtin:mcp" || entry === "!builtin:mcp")
+    ) {
+      return "disabled";
+    }
+    return "absent";
+  }
+
+  function builtinMcpActive(): boolean {
+    return builtinMcpDisposition() === "active";
+  }
 
   function builtinOwnsServer(serverName: string, namespace: string): boolean {
     const prefix = `mcp__${sanitizeSegment(serverName)}__`;
@@ -167,6 +189,7 @@ export function createToolsFallback(
     tools: readonly McpToolDescriptor[],
   ): void {
     if (shutDown) return;
+    if (builtinMcpActive()) return;
     if (builtinOwnsServer(server.name, server.namespace)) return;
 
     const previous = serverRegisteredNames.get(server.name) ?? new Set<string>();
@@ -295,7 +318,7 @@ export function createToolsFallback(
     const server = serverConfigs.get(serverName);
     const client = host.getClient(serverName);
     if (!server || !client || !client.state.tools) return;
-    if (builtinOwnsServer(server.name, server.namespace)) {
+    if (builtinMcpActive() || builtinOwnsServer(server.name, server.namespace)) {
       deactivateServer(serverName);
       return;
     }
@@ -310,19 +333,13 @@ export function createToolsFallback(
     if (!client || !client.state.tools) return false;
     serverConfigs.set(server.name, server);
 
-    if (builtinOwnsServer(server.name, server.namespace)) return false;
-    if (settleMs > 0) {
-      await new Promise<void>((resolve) => {
-        backgroundTimer(setTimeout(resolve, settleMs));
-      });
-    }
-    if (shutDown || builtinOwnsServer(server.name, server.namespace)) return false;
+    if (builtinMcpActive() || builtinOwnsServer(server.name, server.namespace)) return false;
 
     const liveClient = host.getClient(server.name);
     if (!liveClient) return false;
 
     const tools = await fetchServerTools(liveClient);
-    if (shutDown || builtinOwnsServer(server.name, server.namespace)) return false;
+    if (shutDown || builtinMcpActive() || builtinOwnsServer(server.name, server.namespace)) return false;
 
     registerServerTools(server, liveClient, tools);
 
