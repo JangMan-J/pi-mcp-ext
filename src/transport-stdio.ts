@@ -7,6 +7,7 @@ import {
   isErrorResponse,
   isNotification,
   isResponse,
+  META_LOG_LEVEL,
   McpRpcError,
   McpTransportError,
   subscriptionIdOf,
@@ -24,6 +25,7 @@ import type {
 } from "./types.ts";
 
 const STDERR_TAIL_LIMIT = 2_000;
+const MAX_STDOUT_LINE_CHARS = 32 * 1024 * 1024;
 const EOF_WAIT_MS = 150;
 const SHUTDOWN_WAIT_MS = 1_500;
 const SIGKILL_WAIT_MS = 500;
@@ -33,6 +35,7 @@ interface PendingRequest {
   readonly id: RequestId;
   readonly progressToken: RequestId;
   readonly timeoutMs: number | undefined;
+  readonly wantsLogNotifications: boolean;
   readonly onNotification: ((msg: JSONRPCNotification) => void) | undefined;
   timer: ReturnType<typeof setTimeout> | undefined;
   cleanupAbort: (() => void) | undefined;
@@ -104,12 +107,12 @@ function signalProcessGroup(child: ChildProcessWithoutNullStreams, signal: NodeJ
 
 export async function createStdioTransport(
   server: ResolvedStdioServer,
-  opts: { cwd: string; resolveValue?: (v: string) => string },
+  opts: { cwd: string; resolveValue?: (v: string) => string | Promise<string> },
 ): Promise<Mcp2026Transport> {
   const resolveValue = opts.resolveValue ?? ((v: string) => v);
   const resolvedEnv: Record<string, string> = {};
   for (const [key, rawValue] of Object.entries(server.env)) {
-    resolvedEnv[key] = resolveValue(rawValue);
+    resolvedEnv[key] = await resolveValue(rawValue);
   }
 
   const command = expandHome(server.command);
@@ -310,11 +313,15 @@ export async function createStdioTransport(
       }
 
       if (msg.method === "notifications/message") {
-        let target: PendingRequest | undefined;
+        const candidates: PendingRequest[] = [];
         for (const entry of requests.values()) {
-          if (entry.onNotification) target = entry;
+          if (entry.wantsLogNotifications && entry.onNotification) {
+            candidates.push(entry);
+          }
         }
-        target?.onNotification?.(msg);
+        if (candidates.length === 1) {
+          candidates[0].onNotification?.(msg);
+        }
       }
     }
   }
@@ -331,20 +338,41 @@ export async function createStdioTransport(
     handleMessage(parsed);
   }
 
+  let stdoutOffset = 0;
+
   function drainStdout(flush: boolean): void {
-    let newlineIndex = stdoutBuffer.indexOf("\n");
+    let newlineIndex = stdoutBuffer.indexOf("\n", stdoutOffset);
     while (newlineIndex !== -1) {
-      let line = stdoutBuffer.slice(0, newlineIndex);
-      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      let line = stdoutBuffer.slice(stdoutOffset, newlineIndex);
+      stdoutOffset = newlineIndex + 1;
       if (line.endsWith("\r")) line = line.slice(0, -1);
       if (line.length > 0) {
         handleLine(line);
       }
-      newlineIndex = stdoutBuffer.indexOf("\n");
+      newlineIndex = stdoutBuffer.indexOf("\n", stdoutOffset);
     }
-    if (flush && stdoutBuffer.length > 0) {
-      let line = stdoutBuffer;
+    if (stdoutOffset > 0) {
+      if (stdoutOffset === stdoutBuffer.length) {
+        stdoutBuffer = "";
+        stdoutOffset = 0;
+      } else if (stdoutOffset > 65_536) {
+        stdoutBuffer = stdoutBuffer.slice(stdoutOffset);
+        stdoutOffset = 0;
+      }
+    }
+    if (!flush && stdoutBuffer.length - stdoutOffset > MAX_STDOUT_LINE_CHARS) {
       stdoutBuffer = "";
+      stdoutOffset = 0;
+      settleAllInFlight(
+        new McpTransportError("protocol", `MCP stdio server "${server.name}" exceeded 32 MiB line limit`),
+      );
+      signalProcessGroup(child, "SIGTERM");
+      return;
+    }
+    if (flush && stdoutOffset < stdoutBuffer.length) {
+      let line = stdoutBuffer.slice(stdoutOffset);
+      stdoutBuffer = "";
+      stdoutOffset = 0;
       if (line.endsWith("\r")) line = line.slice(0, -1);
       if (line.length > 0) {
         handleLine(line);
@@ -433,6 +461,9 @@ export async function createStdioTransport(
         childExited = true;
         resolveChildExited();
         terminatedHandled = true;
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
         rejectSpawn(
           new McpTransportError(
             "closed",
@@ -484,12 +515,14 @@ export async function createStdioTransport(
 
       const timeoutMs = reqOpts?.timeoutMs;
       const progressToken = extractProgressToken(msg);
+      const wantsLogNotifications = Boolean(msg.params?._meta?.[META_LOG_LEVEL]);
 
       return new Promise<JSONRPCResponse>((resolveReq, rejectReq) => {
         const entry: PendingRequest = {
           id: msg.id,
           progressToken,
           timeoutMs,
+          wantsLogNotifications,
           onNotification: reqOpts?.onNotification,
           timer: undefined,
           cleanupAbort: undefined,

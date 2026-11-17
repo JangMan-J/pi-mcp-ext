@@ -10,19 +10,21 @@
  */
 
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
+import { writePrivateTempFile } from "./temp-files.ts";
+import { validateXMcpHeaders } from "./transport-http.ts";
+import { McpTransportError } from "./types.ts";
 import type {
+  CreateTaskResult,
   EngineHost,
   JSONRPCNotification,
   JsonObject,
   McpExposure,
   ResolvedServer,
   ServerClient,
+  TasksEngineApi,
 } from "./types.ts";
 
 const MAX_INLINE_TEXT_BYTES = 20 * 1024;
@@ -64,9 +66,10 @@ function createFallbackToolName(
   collides: (candidate: string) => boolean,
 ): string {
   const base = `mcp__${sanitizeSegment(serverName)}__${sanitizeSegment(toolName)}`;
-  if (!collides(base)) return base;
-  const suffix = createHash("sha256").update(`${serverName}\0${toolName}`).digest("hex").slice(0, 6);
-  return `${base}_${suffix}`;
+  if (base.length <= 64 && !collides(base)) return base;
+  const suffix = createHash("sha256").update(`${serverName}\0${toolName}`).digest("hex").slice(0, 8);
+  const maxPrefix = 64 - 1 - suffix.length;
+  return `${base.slice(0, maxPrefix)}_${suffix}`;
 }
 
 function patternToRegExp(pattern: string): RegExp {
@@ -94,11 +97,7 @@ function middleTruncateText(text: string): { text: string; fullOutputPath?: stri
   const tail = bytes.subarray(bytes.length - half).toString("utf8");
   const removedChars = Math.max(1, text.length - head.length - tail.length);
   try {
-    const file = join(
-      tmpdir(),
-      `pi-mcp-tool-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.txt`,
-    );
-    writeFileSync(file, text, "utf8");
+    const file = writePrivateTempFile("mcp-tool", "txt", text);
     return {
       text: `${head}\n…${removedChars} chars truncated (full output saved to ${file})…\n${tail}`,
       fullOutputPath: file,
@@ -137,11 +136,7 @@ export function convertToolContentBlocks(
           const mime = typeof raw.mimeType === "string" ? raw.mimeType : "audio/wav";
           const ext = mime.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "wav";
           try {
-            const file = join(
-              tmpdir(),
-              `pi-mcp-audio-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`,
-            );
-            writeFileSync(file, Buffer.from(raw.data, "base64"));
+            const file = writePrivateTempFile("mcp-audio", ext, Buffer.from(raw.data, "base64"));
             content.push({ type: "text", text: `[Audio output (${mime}) saved to ${file}]` });
           } catch {
             content.push({ type: "text", text: `[Audio output (${mime})]` });
@@ -171,11 +166,7 @@ export function convertToolContentBlocks(
             content.push({ type: "image", data: res.blob, mimeType: mime });
           } else {
             try {
-              const file = join(
-                tmpdir(),
-                `pi-mcp-blob-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.bin`,
-              );
-              writeFileSync(file, Buffer.from(res.blob, "base64"));
+              const file = writePrivateTempFile("mcp-blob", "bin", Buffer.from(res.blob, "base64"));
               content.push({
                 type: "text",
                 text: `[Binary resource "${uri}" (${mime}) saved to ${file}]`,
@@ -199,33 +190,52 @@ export function convertToolContentBlocks(
 export function createToolsFallback(
   pi: ExtensionAPI,
   host: EngineHost,
-  opts?: { builtinSettleMs?: number },
+  opts?: { builtinSettleMs?: number; tasks?: TasksEngineApi },
 ): ToolsFallbackApi {
   const settleMs = opts?.builtinSettleMs ?? 120;
   const toolOwners = new Map<string, string>();
   const serverRegisteredNames = new Map<string, Set<string>>();
   const serverConfigs = new Map<string, ResolvedServer>();
   const definitions = new Map<string, ToolDefinition<TSchema, unknown>>();
-  const listenDisposers = new Map<string, () => void>();
+  const listenDisposers = new Map<string, { client: ServerClient; dispose: () => void }>();
   let shutDown = false;
 
   const onAbort = () => void shutdown();
   host.signal?.addEventListener?.("abort", onAbort, { once: true });
 
-  function builtinOwnsServer(namespace: string): boolean {
-    const prefix = `${namespace}__`;
+  function builtinLoaded(): boolean {
+    return pi.getAllTools().some((t) => t.sourceInfo?.path === "builtin:mcp");
+  }
+
+  function builtinOwnsServer(serverName: string, namespace: string, client?: ServerClient): boolean {
+    if (
+      client?.state.supportedVersions?.some((v) => v < "2026-07-28") &&
+      builtinLoaded()
+    ) {
+      return true;
+    }
+    const sanitizedPrefix = `mcp__${sanitizeSegment(serverName)}__`;
+    const nsPrefix = `${namespace}__`;
     const ownNames = new Set<string>();
     for (const set of serverRegisteredNames.values()) {
       for (const n of set) ownNames.add(n);
     }
-    return pi.getAllTools().some((t) => t.name.startsWith(prefix) && !ownNames.has(t.name));
+    return pi.getAllTools().some(
+      (t) =>
+        !ownNames.has(t.name) &&
+        (t.name.startsWith(nsPrefix) ||
+          t.name.startsWith(sanitizedPrefix) ||
+          (t.sourceInfo?.path === "builtin:mcp" &&
+            t.name.startsWith("mcp__") &&
+            sanitizedPrefix.startsWith(t.name.slice(0, Math.min(sanitizedPrefix.length, 40))))),
+    );
   }
 
   async function fetchServerTools(client: ServerClient): Promise<McpToolDescriptor[]> {
     const out: McpToolDescriptor[] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
-    for (let page = 0; page < 32; page += 1) {
+    for (let page = 0; page < 1_000; page += 1) {
       const res = await client.request<JsonObject>("tools/list", cursor ? { cursor } : {});
       const list = Array.isArray(res.tools) ? res.tools : [];
       for (const raw of list) {
@@ -233,6 +243,14 @@ export function createToolsFallback(
         const schema = isRecord(raw.inputSchema)
           ? raw.inputSchema
           : { type: "object", properties: {} };
+        const headerValidation = validateXMcpHeaders(schema);
+        if (!headerValidation.valid) {
+          host.log(
+            "warn",
+            `[${client.name}] Skipping tool "${raw.name}" with invalid x-mcp-header schema: ${headerValidation.reason}`,
+          );
+          continue;
+        }
         out.push({
           name: raw.name,
           ...(typeof raw.title === "string" ? { title: raw.title } : {}),
@@ -243,13 +261,16 @@ export function createToolsFallback(
             : {}),
         });
       }
-      if (typeof res.nextCursor !== "string" || !res.nextCursor || seen.has(res.nextCursor)) {
-        break;
+      if (typeof res.nextCursor !== "string" || !res.nextCursor) {
+        return out;
+      }
+      if (seen.has(res.nextCursor)) {
+        throw new McpTransportError("protocol", `Duplicate pagination cursor on tools/list for "${client.name}"`);
       }
       seen.add(res.nextCursor);
       cursor = res.nextCursor;
     }
-    return out;
+    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on tools/list for "${client.name}"`);
   }
 
   function registerServerTools(
@@ -258,7 +279,7 @@ export function createToolsFallback(
     tools: readonly McpToolDescriptor[],
   ): void {
     if (shutDown) return;
-    if (builtinOwnsServer(server.namespace)) return;
+    if (builtinOwnsServer(server.name, server.namespace, client)) return;
 
     const previous = serverRegisteredNames.get(server.name) ?? new Set<string>();
     const current = new Set<string>();
@@ -294,7 +315,7 @@ export function createToolsFallback(
         label: `${server.name}/${tool.name}`,
         description: tool.description ?? tool.title ?? `MCP tool ${tool.name} on ${server.name}`,
         parameters,
-        exposure: exposure === "codemode" ? "deferred" : exposure,
+        exposure,
         namespace: namespaceObj,
         ...(tool.annotations ? { annotations: tool.annotations } : {}),
         async execute(_toolCallId, params, signal): Promise<AgentToolResult<unknown>> {
@@ -310,6 +331,30 @@ export function createToolsFallback(
             },
             { signal, timeoutMs: server.timeoutMs },
           );
+
+          if (rawResult.resultType === "task") {
+            const record = opts?.tasks?.trackCreatedTask?.(
+              server.name,
+              tool.name,
+              rawResult as unknown as CreateTaskResult,
+            );
+            const summary = JSON.stringify(
+              {
+                resultType: "task",
+                server: server.name,
+                tool: tool.name,
+                taskId: rawResult.taskId,
+                status: rawResult.status,
+                ...(rawResult.statusMessage ? { statusMessage: rawResult.statusMessage } : {}),
+              },
+              null,
+              2,
+            );
+            return {
+              content: [{ type: "text", text: summary }],
+              details: record ?? rawResult,
+            } as AgentToolResult<unknown>;
+          }
 
           const blocks = Array.isArray(rawResult.content) ? rawResult.content : [];
           const converted = convertToolContentBlocks(server.name, blocks);
@@ -362,7 +407,7 @@ export function createToolsFallback(
     const server = serverConfigs.get(serverName);
     const client = host.getClient(serverName);
     if (!server || !client || !client.state.tools) return;
-    if (builtinOwnsServer(server.namespace)) {
+    if (builtinOwnsServer(server.name, server.namespace, client)) {
       deactivateServer(serverName);
       return;
     }
@@ -377,24 +422,26 @@ export function createToolsFallback(
     if (!client || !client.state.tools) return false;
     serverConfigs.set(server.name, server);
 
-    if (builtinOwnsServer(server.namespace)) return false;
+    if (builtinOwnsServer(server.name, server.namespace, client)) return false;
     if (settleMs > 0) {
       await new Promise<void>((resolve) => {
         const t = setTimeout(resolve, settleMs);
         t.unref?.();
       });
     }
-    if (shutDown || builtinOwnsServer(server.namespace)) return false;
+    if (shutDown || builtinOwnsServer(server.name, server.namespace, client)) return false;
 
     const liveClient = host.getClient(server.name);
     if (!liveClient) return false;
 
     const tools = await fetchServerTools(liveClient);
-    if (shutDown || builtinOwnsServer(server.namespace)) return false;
+    if (shutDown || builtinOwnsServer(server.name, server.namespace, liveClient)) return false;
 
     registerServerTools(server, liveClient, tools);
 
-    if (liveClient.state.toolsListChanged && !listenDisposers.has(server.name)) {
+    const existingLd = listenDisposers.get(server.name);
+    if (liveClient.state.toolsListChanged && existingLd?.client !== liveClient) {
+      existingLd?.dispose();
       liveClient.setListenInterest("tools", { toolsListChanged: true });
       const off = liveClient.onListenNotification((msg: JSONRPCNotification) => {
         if (msg.method === "notifications/tools/list_changed") {
@@ -406,9 +453,12 @@ export function createToolsFallback(
           );
         }
       });
-      listenDisposers.set(server.name, () => {
-        off();
-        liveClient.setListenInterest("tools", {});
+      listenDisposers.set(server.name, {
+        client: liveClient,
+        dispose: () => {
+          off();
+          liveClient.setListenInterest("tools", {});
+        },
       });
     }
 
@@ -416,7 +466,7 @@ export function createToolsFallback(
   }
 
   function deactivateServer(serverName: string): void {
-    listenDisposers.get(serverName)?.();
+    listenDisposers.get(serverName)?.dispose();
     listenDisposers.delete(serverName);
     serverConfigs.delete(serverName);
     const names = serverRegisteredNames.get(serverName);
@@ -435,9 +485,12 @@ export function createToolsFallback(
     if (shutDown) return;
     shutDown = true;
     host.signal?.removeEventListener?.("abort", onAbort);
-    for (const dispose of listenDisposers.values()) {
+    for (const serverName of [...serverRegisteredNames.keys()]) {
+      deactivateServer(serverName);
+    }
+    for (const ld of listenDisposers.values()) {
       try {
-        dispose();
+        ld.dispose();
       } catch {
         /* ignore */
       }

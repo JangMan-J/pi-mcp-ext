@@ -35,22 +35,30 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 export function sanitizeFormText(raw: string): string {
   return raw
     .replace(ANSI_RE, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, "")
     .replace(/\b(https?|ftp|file|javascript):\/\//gi, (_m, scheme: string) => `${scheme}[:]//`);
 }
 
 function stripControlChars(raw: string): string {
-  return raw.replace(ANSI_RE, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  return raw.replace(ANSI_RE, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, "");
 }
 
 export function openExternalBrowser(url: string): void {
+  const checked = inspectElicitationUrl(url);
+  if (!checked.valid || !checked.href) {
+    throw new Error(checked.error ?? "Refused to launch unsafe elicitation URL");
+  }
+  const safeUrl = checked.href;
   const cmd =
     process.platform === "darwin"
       ? "open"
       : process.platform === "win32"
-        ? "cmd"
+        ? "rundll32.exe"
         : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const args =
+    process.platform === "win32" ? ["url.dll,FileProtocolHandler", safeUrl] : [safeUrl];
   const child = spawn(cmd, args, {
+    shell: false,
     stdio: "ignore",
     detached: true,
     windowsHide: true,
@@ -66,7 +74,11 @@ export function inspectElicitationUrl(rawUrl: unknown): {
   warnings: string[];
   error?: string;
 } {
-  if (typeof rawUrl !== "string" || !URL.canParse(rawUrl)) {
+  if (
+    typeof rawUrl !== "string" ||
+    /[\x00-\x20\x7f]/.test(rawUrl) ||
+    !URL.canParse(rawUrl)
+  ) {
     return { valid: false, warnings: [], error: "Invalid elicitation URL" };
   }
   const parsed = new URL(rawUrl);
@@ -447,12 +459,12 @@ export async function runElicitationPrompt(
   for (;;) {
     const summaryLines = propEntries.map(([key]) => {
       const val = content[key];
-      return `  ${key}: ${val === undefined ? "(omitted)" : JSON.stringify(val)}`;
+      return `  ${sanitizeFormText(key)}: ${val === undefined ? "(omitted)" : sanitizeFormText(JSON.stringify(val))}`;
     });
     const reviewTitle =
       `[MCP server "${serverName}" — Review before sending]\n` + summaryLines.join("\n");
     const submitLabel = "Submit (Accept)";
-    const editOptions = propEntries.map(([key]) => `Edit "${key}"`);
+    const editOptions = propEntries.map(([key]) => `Edit "${sanitizeFormText(key)}"`);
     const declineLabel = "Decline";
     const cancelLabel = "Cancel";
     const picked = await ui.select(reviewTitle, [

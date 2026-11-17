@@ -33,14 +33,42 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+export function isLoopbackUrl(raw: string): boolean {
+  if (!URL.canParse(raw)) return false;
+  return LOOPBACK_HOSTS.has(new URL(raw).hostname);
+}
+
 export function isSecureOrLoopbackUrl(raw: string): boolean {
   if (!URL.canParse(raw)) return false;
   const u = new URL(raw);
   return u.protocol === "https:" || (u.protocol === "http:" && LOOPBACK_HOSTS.has(u.hostname));
 }
 
-function trimTrailingSlash(value: string): string {
-  return value.endsWith("/") ? value.slice(0, -1) : value;
+function isAllowedEndpointForServer(endpointUrl: string, serverIsLoopback: boolean): boolean {
+  if (!isSecureOrLoopbackUrl(endpointUrl)) return false;
+  if (!serverIsLoopback && isLoopbackUrl(endpointUrl)) return false;
+  return true;
+}
+
+const OAUTH_HTTP_TIMEOUT_MS = 10_000;
+
+function withBoundedSignal(outer?: AbortSignal, timeoutMs = OAUTH_HTTP_TIMEOUT_MS): {
+  signal: AbortSignal;
+  cleanup(): void;
+} {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  outer?.addEventListener("abort", onAbort, { once: true });
+  if (outer?.aborted) controller.abort();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+      outer?.removeEventListener("abort", onAbort);
+    },
+  };
 }
 
 function pathSuffix(pathname: string): string {
@@ -123,39 +151,46 @@ export function parseClientCredentialsConfig(
     return { warning: "clientCredentials.scope must be a string; ignored" };
   }
 
+  const serverIsLoopback = isLoopbackUrl(serverUrl);
+
   const issuer = raw.issuer ?? raw.expectedIssuer;
-  if (issuer !== undefined && (typeof issuer !== "string" || !isSecureOrLoopbackUrl(issuer))) {
+  if (typeof issuer !== "string" || !issuer.trim()) {
     return {
       warning:
-        "clientCredentials.issuer must be an https URL (or http on localhost/127.0.0.1/[::1]); ignored",
+        "clientCredentials requires a pinned issuer URL to prevent credential redirection; ignored",
+    };
+  }
+  if (!issuer.startsWith("!") && !issuer.includes("$") && !isAllowedEndpointForServer(issuer, serverIsLoopback)) {
+    return {
+      warning:
+        "clientCredentials.issuer must be an https URL (or loopback URL when MCP server is loopback); ignored",
     };
   }
 
   const authServerMetadataUrl = raw.authServerMetadataUrl;
   if (
     authServerMetadataUrl !== undefined &&
-    (typeof authServerMetadataUrl !== "string" || !isSecureOrLoopbackUrl(authServerMetadataUrl))
+    (typeof authServerMetadataUrl !== "string" ||
+      (!authServerMetadataUrl.startsWith("!") &&
+        !authServerMetadataUrl.includes("$") &&
+        !isAllowedEndpointForServer(authServerMetadataUrl, serverIsLoopback)))
   ) {
     return {
       warning:
-        "clientCredentials.authServerMetadataUrl must be an https or loopback URL; ignored",
+        "clientCredentials.authServerMetadataUrl must be an https URL (or loopback when server is loopback); ignored",
     };
   }
 
   const tokenEndpoint = raw.tokenEndpoint;
   if (
     tokenEndpoint !== undefined &&
-    (typeof tokenEndpoint !== "string" || !isSecureOrLoopbackUrl(tokenEndpoint))
+    (typeof tokenEndpoint !== "string" ||
+      (!tokenEndpoint.startsWith("!") &&
+        !tokenEndpoint.includes("$") &&
+        !isAllowedEndpointForServer(tokenEndpoint, serverIsLoopback)))
   ) {
     return {
-      warning: "clientCredentials.tokenEndpoint must be an https or loopback URL; ignored",
-    };
-  }
-
-  if (privateKey !== undefined && tokenEndpoint !== undefined && issuer === undefined && authServerMetadataUrl === undefined) {
-    return {
-      warning:
-        "clientCredentials with privateKey and tokenEndpoint requires issuer (RFC 10070 aud claim); ignored",
+      warning: "clientCredentials.tokenEndpoint must be an https URL (or loopback when server is loopback); ignored",
     };
   }
 
@@ -167,7 +202,7 @@ export function parseClientCredentialsConfig(
       ...(typeof algorithm === "string" ? { algorithm: algorithm as JwtSigningAlgorithm } : {}),
       ...(typeof kid === "string" ? { kid } : {}),
       ...(typeof scopeVal === "string" ? { scope: scopeVal } : {}),
-      ...(typeof issuer === "string" ? { issuer } : {}),
+      issuer,
       ...(typeof authServerMetadataUrl === "string" ? { authServerMetadataUrl } : {}),
       ...(typeof tokenEndpoint === "string" ? { tokenEndpoint } : {}),
     },
@@ -255,23 +290,31 @@ function validateProtectedResourceMatch(serverUrl: string, resourceUri: string):
 async function fetchJson(
   url: URL,
   fetchFn: typeof fetch,
+  outerSignal?: AbortSignal,
 ): Promise<{ ok: boolean; status: number; body?: Record<string, unknown> }> {
-  const res = await fetchFn(url, {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      "MCP-Protocol-Version": PROTOCOL_VERSION,
-    },
-  });
-  if (!res.ok) {
-    await res.body?.cancel().catch(() => {});
-    return { ok: false, status: res.status };
+  const bounded = withBoundedSignal(outerSignal);
+  try {
+    const res = await fetchFn(url, {
+      method: "GET",
+      redirect: "error",
+      signal: bounded.signal,
+      headers: {
+        Accept: "application/json",
+        "MCP-Protocol-Version": PROTOCOL_VERSION,
+      },
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return { ok: false, status: res.status };
+    }
+    const parsed: unknown = await res.json();
+    if (!isRecord(parsed)) {
+      throw new Error(`Invalid JSON object from OAuth metadata endpoint ${url.href}`);
+    }
+    return { ok: true, status: res.status, body: parsed };
+  } finally {
+    bounded.cleanup();
   }
-  const parsed: unknown = await res.json();
-  if (!isRecord(parsed)) {
-    throw new Error(`Invalid JSON object from OAuth metadata endpoint ${url.href}`);
-  }
-  return { ok: true, status: res.status, body: parsed };
 }
 
 async function discoverEndpoints(
@@ -282,22 +325,31 @@ async function discoverEndpoints(
     tokenEndpoint?: string;
   },
   fetchFn: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<DiscoveredEndpoints> {
   const serverParsed = new URL(serverUrl);
   serverParsed.hash = "";
+  const serverIsLoopback = isLoopbackUrl(serverUrl);
   let resourceUri = serverParsed.href;
   let advertisedIssuer: string | undefined;
   let defaultScopes: string[] | undefined;
 
-  // Step 1: Protected Resource Metadata (RFC 9728) unless explicit endpoints already cover everything.
-  if (!cfg.tokenEndpoint || (!cfg.issuer && !cfg.authServerMetadataUrl)) {
+  if (!cfg.issuer || !isAllowedEndpointForServer(cfg.issuer, serverIsLoopback)) {
+    throw new Error(
+      `OAuth client_credentials requires a pinned https issuer (or loopback issuer when MCP server is loopback)`,
+    );
+  }
+  const pinnedIssuer = cfg.issuer;
+
+  // Step 1: Protected Resource Metadata (RFC 9728) to obtain resource URI, scopes, and verify advertised AS.
+  if (!cfg.tokenEndpoint || !cfg.authServerMetadataUrl) {
     const suffix = pathSuffix(serverParsed.pathname);
     const candidates = [
       new URL(`/.well-known/oauth-protected-resource${suffix}`, serverParsed.origin),
       ...(suffix ? [new URL("/.well-known/oauth-protected-resource", serverParsed.origin)] : []),
     ];
     for (const candidate of candidates) {
-      const resp = await fetchJson(candidate, fetchFn);
+      const resp = await fetchJson(candidate, fetchFn, signal);
       if (!resp.ok) {
         if ((resp.status >= 400 && resp.status < 500) || resp.status === 502) continue;
         throw new Error(`HTTP ${resp.status} discovering OAuth protected resource metadata`);
@@ -316,31 +368,32 @@ async function discoverEndpoints(
     }
   }
 
-  if (cfg.issuer && advertisedIssuer && trimTrailingSlash(advertisedIssuer) !== trimTrailingSlash(cfg.issuer)) {
+  if (advertisedIssuer !== undefined && advertisedIssuer !== pinnedIssuer) {
     throw new Error(
-      `OAuth issuer mismatch: expected "${cfg.issuer}", resource advertised "${advertisedIssuer}"`,
+      `OAuth issuer mismatch: expected "${pinnedIssuer}", resource advertised "${advertisedIssuer}"`,
     );
   }
 
   // If tokenEndpoint is explicitly configured alongside pinned issuer, skip AS discovery.
-  if (cfg.tokenEndpoint && cfg.issuer && !cfg.authServerMetadataUrl) {
-    if (advertisedIssuer && trimTrailingSlash(advertisedIssuer) !== trimTrailingSlash(cfg.issuer)) {
-      throw new Error(
-        `OAuth issuer mismatch: expected "${cfg.issuer}", resource advertised "${advertisedIssuer}"`,
-      );
+  if (cfg.tokenEndpoint && !cfg.authServerMetadataUrl) {
+    if (!isAllowedEndpointForServer(cfg.tokenEndpoint, serverIsLoopback)) {
+      throw new Error(`OAuth tokenEndpoint "${cfg.tokenEndpoint}" is not permitted for server "${serverUrl}"`);
     }
     return {
-      issuer: cfg.issuer,
+      issuer: pinnedIssuer,
       tokenEndpoint: cfg.tokenEndpoint,
       resourceUri,
       defaultScopes,
     };
   }
 
-  // Step 2: Authorization Server Metadata (RFC 8414 / OpenID Connect Discovery 1.0).
+  // Step 2: Authorization Server Metadata (RFC 8414 / OpenID Connect Discovery 1.0) strictly from pinned issuer.
   let asMeta: Record<string, unknown> | undefined;
   if (cfg.authServerMetadataUrl) {
-    const resp = await fetchJson(new URL(cfg.authServerMetadataUrl), fetchFn);
+    if (!isAllowedEndpointForServer(cfg.authServerMetadataUrl, serverIsLoopback)) {
+      throw new Error(`OAuth authServerMetadataUrl "${cfg.authServerMetadataUrl}" is not permitted`);
+    }
+    const resp = await fetchJson(new URL(cfg.authServerMetadataUrl), fetchFn, signal);
     if (!resp.ok || !resp.body) {
       throw new Error(
         `HTTP ${resp.status} loading authorization server metadata from ${cfg.authServerMetadataUrl}`,
@@ -348,11 +401,7 @@ async function discoverEndpoints(
     }
     asMeta = resp.body;
   } else {
-    const issuerCandidate = cfg.issuer ?? advertisedIssuer ?? new URL("/", serverParsed.origin).href;
-    if (!isSecureOrLoopbackUrl(issuerCandidate)) {
-      throw new Error(`Authorization server URL "${issuerCandidate}" must use https (or loopback http)`);
-    }
-    const issuerUrl = new URL(issuerCandidate);
+    const issuerUrl = new URL(pinnedIssuer);
     const suffix = pathSuffix(issuerUrl.pathname);
     const asCandidates = [
       new URL(`/.well-known/oauth-authorization-server${suffix}`, issuerUrl.origin),
@@ -360,15 +409,15 @@ async function discoverEndpoints(
       ...(suffix ? [new URL(`${suffix}/.well-known/openid-configuration`, issuerUrl.origin)] : []),
     ];
     for (const candidate of asCandidates) {
-      const resp = await fetchJson(candidate, fetchFn);
+      const resp = await fetchJson(candidate, fetchFn, signal);
       if (!resp.ok) {
         if ((resp.status >= 400 && resp.status < 500) || resp.status === 502) continue;
         throw new Error(`HTTP ${resp.status} loading authorization server metadata from ${candidate.href}`);
       }
       const meta = resp.body!;
-      if (typeof meta.issuer !== "string" || trimTrailingSlash(meta.issuer) !== trimTrailingSlash(issuerCandidate)) {
+      if (typeof meta.issuer !== "string" || meta.issuer !== pinnedIssuer) {
         throw new Error(
-          `OAuth issuer mismatch: expected "${issuerCandidate}", metadata reported "${String(meta.issuer)}"`,
+          `OAuth issuer mismatch: expected "${pinnedIssuer}", metadata reported "${String(meta.issuer)}"`,
         );
       }
       asMeta = meta;
@@ -384,15 +433,15 @@ async function discoverEndpoints(
   if (!discoveredIssuer) {
     throw new Error("Authorization server metadata is missing required \"issuer\" field");
   }
-  if (cfg.issuer && trimTrailingSlash(discoveredIssuer) !== trimTrailingSlash(cfg.issuer)) {
+  if (discoveredIssuer !== pinnedIssuer) {
     throw new Error(
-      `OAuth issuer mismatch: expected "${cfg.issuer}", metadata reported "${discoveredIssuer}"`,
+      `OAuth issuer mismatch: expected "${pinnedIssuer}", metadata reported "${discoveredIssuer}"`,
     );
   }
 
   const tokenEndpoint = cfg.tokenEndpoint ?? (typeof asMeta.token_endpoint === "string" ? asMeta.token_endpoint : undefined);
-  if (!tokenEndpoint || !isSecureOrLoopbackUrl(tokenEndpoint)) {
-    throw new Error("Authorization server metadata is missing a valid https/loopback \"token_endpoint\"");
+  if (!tokenEndpoint || !isAllowedEndpointForServer(tokenEndpoint, serverIsLoopback)) {
+    throw new Error("Authorization server metadata is missing a valid https (or matching loopback) \"token_endpoint\"");
   }
 
   const authMethods = Array.isArray(asMeta.token_endpoint_auth_methods_supported)
@@ -416,7 +465,7 @@ export function createClientCredentialsResolver(
   server: ResolvedHttpServer,
   opts?: {
     fetch?: typeof fetch;
-    resolveValue?: (v: string) => string;
+    resolveValue?: (v: string) => string | Promise<string>;
   },
 ): AuthResolver {
   const fetchFn = opts?.fetch ?? fetch;
@@ -432,28 +481,29 @@ export function createClientCredentialsResolver(
   let cachedEndpoints: DiscoveredEndpoints | undefined;
   let inflight: Promise<string> | undefined;
 
-  async function acquireToken(forceRefresh: boolean): Promise<string> {
+  async function acquireToken(forceRefresh: boolean, signal?: AbortSignal): Promise<string> {
     if (!forceRefresh && cachedToken && Date.now() < expiresAtMs) {
       return cachedToken;
     }
-    if (inflight) return inflight;
+    if (inflight && !signal?.aborted) return inflight;
 
-    inflight = (async (): Promise<string> => {
-      const clientId = resolveVal(cfg.clientId);
-      const clientSecret = cfg.clientSecret !== undefined ? resolveVal(cfg.clientSecret) : undefined;
-      const privateKey = cfg.privateKey !== undefined ? resolveVal(cfg.privateKey) : undefined;
-      const issuer = cfg.issuer !== undefined ? resolveVal(cfg.issuer) : undefined;
+    const run = (async (): Promise<string> => {
+      const clientId = await resolveVal(cfg.clientId);
+      const clientSecret = cfg.clientSecret !== undefined ? await resolveVal(cfg.clientSecret) : undefined;
+      const privateKey = cfg.privateKey !== undefined ? await resolveVal(cfg.privateKey) : undefined;
+      const issuer = cfg.issuer !== undefined ? await resolveVal(cfg.issuer) : undefined;
       const authServerMetadataUrl =
-        cfg.authServerMetadataUrl !== undefined ? resolveVal(cfg.authServerMetadataUrl) : undefined;
-      const tokenEndpoint = cfg.tokenEndpoint !== undefined ? resolveVal(cfg.tokenEndpoint) : undefined;
-      const scope = cfg.scope !== undefined ? resolveVal(cfg.scope) : undefined;
-      const kid = cfg.kid !== undefined ? resolveVal(cfg.kid) : undefined;
+        cfg.authServerMetadataUrl !== undefined ? await resolveVal(cfg.authServerMetadataUrl) : undefined;
+      const tokenEndpoint = cfg.tokenEndpoint !== undefined ? await resolveVal(cfg.tokenEndpoint) : undefined;
+      const scope = cfg.scope !== undefined ? await resolveVal(cfg.scope) : undefined;
+      const kid = cfg.kid !== undefined ? await resolveVal(cfg.kid) : undefined;
 
       if (!cachedEndpoints || forceRefresh) {
         cachedEndpoints = await discoverEndpoints(
           server.url,
           { issuer, authServerMetadataUrl, tokenEndpoint },
           fetchFn,
+          signal,
         );
       }
 
@@ -507,11 +557,19 @@ export function createClientCredentialsResolver(
         throw new Error(`MCP server "${server.name}" clientCredentials has neither clientSecret nor privateKey`);
       }
 
-      const res = await fetchFn(cachedEndpoints.tokenEndpoint, {
-        method: "POST",
-        headers,
-        body: body.toString(),
-      });
+      const bounded = withBoundedSignal(signal);
+      let res: Response;
+      try {
+        res = await fetchFn(cachedEndpoints.tokenEndpoint, {
+          method: "POST",
+          redirect: "error",
+          signal: bounded.signal,
+          headers,
+          body: body.toString(),
+        });
+      } finally {
+        bounded.cleanup();
+      }
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
         throw new Error(
@@ -527,29 +585,32 @@ export function createClientCredentialsResolver(
         typeof tokenJson.expires_in === "number" && Number.isFinite(tokenJson.expires_in) && tokenJson.expires_in > 0
           ? tokenJson.expires_in
           : 300;
-      // Refresh 30s early (or at 80% of short-lived tokens).
-      const ttlMs = Math.max(1_000, Math.min(expiresInSec * 1000 - 30_000, Math.floor(expiresInSec * 800)));
+      const ttlMs =
+        expiresInSec > 60
+          ? (expiresInSec - 30) * 1000
+          : Math.max(1_000, Math.floor(expiresInSec * 800));
       cachedToken = tokenJson.access_token;
       expiresAtMs = Date.now() + ttlMs;
       return cachedToken;
     })().finally(() => {
-      inflight = undefined;
+      if (inflight === run) inflight = undefined;
     });
 
-    return inflight;
+    inflight = run;
+    return run;
   }
 
   return {
-    async authorization(): Promise<string | undefined> {
-      const token = await acquireToken(false);
+    async authorization(signal?: AbortSignal): Promise<string | undefined> {
+      const token = await acquireToken(false, signal);
       return `Bearer ${token}`;
     },
-    async refreshAfterUnauthorized(): Promise<boolean> {
+    async refreshAfterUnauthorized(signal?: AbortSignal): Promise<boolean> {
       const previous = cachedToken;
       cachedToken = undefined;
       expiresAtMs = 0;
       try {
-        const next = await acquireToken(true);
+        const next = await acquireToken(true, signal);
         return Boolean(next && next !== previous);
       } catch {
         return false;

@@ -405,12 +405,12 @@ export interface ConfigLoadOptions {
 /** Per-request `Authorization` for one HTTP server (spec §2.3). Never writes anything. */
 export interface AuthResolver {
   /** Resolved `Authorization` value or undefined. */
-  authorization(): Promise<string | undefined>;
+  authorization(signal?: AbortSignal): Promise<string | undefined>;
   /**
-   * After a 401: wait 250 ms, re-read mcp-auth.json, and return true when the token changed
-   * (the caller retries once). False means the server needs sign-in.
+   * After a 401: wait 250 ms, re-read mcp-auth.json (or rotate client_credentials), and return true
+   * when the token changed (the caller retries once). False means the server needs sign-in.
    */
-  refreshAfterUnauthorized(): Promise<boolean>;
+  refreshAfterUnauthorized(signal?: AbortSignal): Promise<boolean>;
 }
 
 /** Resolves a provider token through Pi (`ctx.modelRegistry.getProviderAuth(provider)`). */
@@ -620,6 +620,8 @@ export interface EventsEngineApi {
   restore(branch: readonly unknown[], allEntries: readonly unknown[]): void;
   /** A server became modern with events: (re)start its subscriptions. */
   serverReady(server: string): void;
+  /** Stop polling/streams for a server removed or disabled during config reload. */
+  serverRemoved?(server: string): void;
   list(server: string, opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void }): Promise<EventDescriptor[]>;
   subscribe(req: SubscribeRequest): Promise<SubscriptionRecord>;
   unsubscribe(server: string, name: string, args?: JsonObject): Promise<boolean>;
@@ -634,6 +636,8 @@ export interface EventsEngineApi {
   holdsSettle(): boolean;
   /** Count of open push streams (for the footer). */
   activeStreams(): number;
+  /** Flush any coalesced pending wake batch before aborting the session. */
+  flushPending?(): void;
   /** Notifies after each wake (for settle hold). */
   onWake(listener: () => void): () => void;
   /** Notifies when subscription/stream/hold state changes without requiring polling. */
@@ -645,6 +649,9 @@ export interface EventsEngineApi {
 export interface TasksEngineApi {
   restore(allEntries: readonly unknown[]): void;
   serverReady(server: string): void;
+  serverRemoved?(server: string): void;
+  /** Track a `CreateTaskResult` returned from an external `tools/call` (e.g. `tools-fallback`). */
+  trackCreatedTask?(server: string, tool: string, out: CreateTaskResult): TaskRecord;
   /** `tools/call` with tasks in _meta; tracks a returned task. Returns the raw outcome. */
   call(
     server: string,

@@ -7,11 +7,9 @@
  * parsing/autocompletion.
  */
 
-import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { ErrorCode, McpRpcError } from "./types.ts";
+import { writePrivateTempFile } from "./temp-files.ts";
+import { ErrorCode, McpRpcError, McpTransportError } from "./types.ts";
 import type {
   EngineHost,
   JSONRPCNotification,
@@ -56,6 +54,7 @@ type LogOpts = { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void 
 
 export interface PromptsEngineApi {
   serverReady(server: string): Promise<PromptDescriptor[]>;
+  serverRemoved?(server: string): void;
   list(server: string, opts?: LogOpts): Promise<PromptDescriptor[]>;
   cachedPrompts(): Array<{ server: string; prompt: PromptDescriptor }>;
   get(
@@ -77,6 +76,19 @@ export interface PromptsEngineApi {
 
 const COMPLETION_CACHE_MAX = 256;
 const COMPLETION_CACHE_TTL_MS = 15_000;
+
+function escapeAttr(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeCloseTags(value: string): string {
+  return value.replace(/<\/(mcp_[a-zA-Z0-9_]*)/gi, "<\\/$1");
+}
 
 function isRecord(v: unknown): v is JsonObject {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -239,11 +251,7 @@ function renderPromptMessages(
           const mime = typeof c.mimeType === "string" ? c.mimeType : "audio/wav";
           const ext = mime.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "wav";
           try {
-            const file = join(
-              tmpdir(),
-              `pi-mcp-prompt-audio-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`,
-            );
-            writeFileSync(file, Buffer.from(c.data, "base64"));
+            const file = writePrivateTempFile("mcp-prompt-audio", ext, Buffer.from(c.data, "base64"));
             lines.push(`${prefix}[Audio content (${mime}) saved to ${file}]`);
           } catch {
             lines.push(`${prefix}[Audio content (${mime})]`);
@@ -263,7 +271,9 @@ function renderPromptMessages(
         const res = isRecord(c.resource) ? c.resource : {};
         const uri = typeof res.uri === "string" ? res.uri : "resource";
         if (typeof res.text === "string") {
-          lines.push(`${prefix}<mcp_prompt_resource server="${server}" uri="${uri}">\n${res.text}\n</mcp_prompt_resource>`);
+          lines.push(
+            `${prefix}<mcp_prompt_resource server="${escapeAttr(server)}" uri="${escapeAttr(uri)}">\n${escapeCloseTags(res.text)}\n</mcp_prompt_resource>`,
+          );
         } else if (typeof res.blob === "string") {
           const mime = typeof res.mimeType === "string" ? res.mimeType : "application/octet-stream";
           if (/^image\/(png|jpeg|jpg|gif|webp)$/i.test(mime)) {
@@ -286,7 +296,7 @@ function renderPromptMessages(
 export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
   const promptCache = new Map<string, PromptDescriptor[]>();
   const inflightLists = new Map<string, Promise<PromptDescriptor[]>>();
-  const listenDisposers = new Map<string, () => void>();
+  const listenDisposers = new Map<string, { client: ServerClient; dispose: () => void }>();
   const changeListeners = new Set<(server: string, prompts: PromptDescriptor[]) => void>();
   const completionCache = new Map<string, { expiresAt: number; value: CompletionOutcome }>();
   const inflightCompletions = new Map<string, Promise<CompletionOutcome>>();
@@ -306,7 +316,11 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
   }
 
   function ensureListen(server: string, client: ServerClient): void {
-    if (listenDisposers.has(server) || !client.state.promptsListChanged) return;
+    const existing = listenDisposers.get(server);
+    if (existing?.client === client) return;
+    existing?.dispose();
+    listenDisposers.delete(server);
+    if (!client.state.promptsListChanged) return;
     client.setListenInterest("prompts", { promptsListChanged: true });
     const off = client.onListenNotification((msg: JSONRPCNotification) => {
       if (msg.method === "notifications/prompts/list_changed") {
@@ -316,9 +330,12 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
         );
       }
     });
-    listenDisposers.set(server, () => {
-      off();
-      client.setListenInterest("prompts", {});
+    listenDisposers.set(server, {
+      client,
+      dispose: () => {
+        off();
+        client.setListenInterest("prompts", {});
+      },
     });
   }
 
@@ -331,7 +348,7 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
     const seen = new Set<string>();
     let cursor: string | undefined;
     const reqOpts = toReqOpts(opts);
-    for (let page = 0; page < 32; page += 1) {
+    for (let page = 0; page < 1_000; page += 1) {
       const res = await client.request<JsonObject>(
         "prompts/list",
         cursor ? { cursor } : {},
@@ -358,15 +375,18 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
           ...(args ? { arguments: args } : {}),
         });
       }
-      if (typeof res.nextCursor !== "string" || !res.nextCursor || seen.has(res.nextCursor)) {
-        break;
+      if (typeof res.nextCursor !== "string" || !res.nextCursor) {
+        promptCache.set(server, out);
+        emitChanged(server, out);
+        return out;
+      }
+      if (seen.has(res.nextCursor)) {
+        throw new McpTransportError("protocol", `Duplicate pagination cursor on prompts/list for "${server}"`);
       }
       seen.add(res.nextCursor);
       cursor = res.nextCursor;
     }
-    promptCache.set(server, out);
-    emitChanged(server, out);
-    return out;
+    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on prompts/list for "${server}"`);
   }
 
   async function list(server: string, opts?: LogOpts): Promise<PromptDescriptor[]> {
@@ -376,6 +396,8 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
     if (opts?.logLevel || opts?.onLog) {
       return fetchPrompts(server, client, opts);
     }
+    const cached = promptCache.get(server);
+    if (cached && client.state.promptsListChanged) return cached;
     const pending = inflightLists.get(server);
     if (pending) return pending;
     const promise = fetchPrompts(server, client).finally(() => {
@@ -389,7 +411,22 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
     if (shutDown) return [];
     const client = host.getClient(server);
     if (!client || !client.state.prompts) return [];
+    promptCache.delete(server);
     return list(server);
+  }
+
+  function serverRemoved(server: string): void {
+    const ld = listenDisposers.get(server);
+    if (ld) {
+      try {
+        ld.dispose();
+      } catch {
+        /* ignore */
+      }
+      listenDisposers.delete(server);
+    }
+    promptCache.delete(server);
+    inflightLists.delete(server);
   }
 
   async function get(
@@ -431,7 +468,7 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
   ): Promise<CompletionOutcome> {
     const client = host.getClient(server);
     if (!client) throw new Error(`Unknown or not-ready MCP server: ${server}`);
-    if (!client.state.completions && !opts?.logLevel && !opts?.onLog) {
+    if (!client.state.completions) {
       return { values: [], hasMore: false };
     }
 
@@ -495,9 +532,9 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
     if (shutDown) return;
     shutDown = true;
     host.signal?.removeEventListener?.("abort", onAbort);
-    for (const dispose of listenDisposers.values()) {
+    for (const ld of listenDisposers.values()) {
       try {
-        dispose();
+        ld.dispose();
       } catch {
         /* ignore */
       }
@@ -510,6 +547,7 @@ export function createPromptsEngine(host: EngineHost): PromptsEngineApi {
 
   return {
     serverReady,
+    serverRemoved,
     list,
     cachedPrompts: () => {
       const out: Array<{ server: string; prompt: PromptDescriptor }> = [];

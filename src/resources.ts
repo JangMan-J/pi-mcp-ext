@@ -6,11 +6,9 @@
  * the shared per-server `subscriptions/listen` stream.
  */
 
-import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
+import { writePrivateTempFile } from "./temp-files.ts";
 import {
   CUSTOM_RESOURCE_SUBSCRIPTIONS,
   ErrorCode,
@@ -65,6 +63,8 @@ type LogOpts = { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void 
 export interface ResourcesEngineApi {
   restore(branch: readonly unknown[]): void;
   serverReady(server: string): void;
+  serverRemoved?(server: string): void;
+  flushPending?(): void;
   list(
     server: string,
     cursor?: string,
@@ -158,11 +158,7 @@ export function convertResourceContentsToBlocks(
       let text = truncated.content;
       if (truncated.truncated) {
         try {
-          const file = join(
-            tmpdir(),
-            `pi-mcp-resource-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.txt`,
-          );
-          writeFileSync(file, item.text, "utf8");
+          const file = writePrivateTempFile("mcp-resource", "txt", item.text);
           text += `\n[truncated: full resource written to ${file}]`;
         } catch {
           text += "\n[truncated]";
@@ -182,11 +178,7 @@ export function convertResourceContentsToBlocks(
       }
       try {
         const bytes = Buffer.from(item.blob, "base64");
-        const file = join(
-          tmpdir(),
-          `pi-mcp-resource-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${extFromMime(mimeType)}`,
-        );
-        writeFileSync(file, bytes);
+        const file = writePrivateTempFile("mcp-resource", extFromMime(mimeType), bytes);
         blocks.push({
           type: "text",
           text: `Binary resource "${uri}" from MCP server "${server}" (${mimeType ?? "application/octet-stream"}, ${bytes.length} bytes) saved to ${file}`,
@@ -238,7 +230,10 @@ export function createResourcesEngine(
   host.signal?.addEventListener?.("abort", onAbort, { once: true });
 
   function flushBatch(): void {
-    batchTimer = undefined;
+    if (batchTimer) {
+      clearTimeout(batchTimer);
+      batchTimer = undefined;
+    }
     if (pendingUpdates.size === 0) return;
     const items = [...pendingUpdates.values()];
     pendingUpdates.clear();
@@ -361,7 +356,7 @@ export function createResourcesEngine(
     const all: McpResourceItem[] = [];
     const seen = new Set<string>();
     let next: string | undefined;
-    for (let i = 0; i < 32; i += 1) {
+    for (let i = 0; i < 1_000; i += 1) {
       const page = await client.request<JsonObject>(
         "resources/list",
         next ? { cursor: next } : {},
@@ -373,13 +368,16 @@ export function createResourcesEngine(
         if (isMcpAppResource(item.uri, item.mimeType as string | undefined)) continue;
         all.push(stripResourceIcons(item) as unknown as McpResourceItem);
       }
-      if (typeof page.nextCursor !== "string" || !page.nextCursor || seen.has(page.nextCursor)) {
-        break;
+      if (typeof page.nextCursor !== "string" || !page.nextCursor) {
+        return { resources: all };
+      }
+      if (seen.has(page.nextCursor)) {
+        throw new McpTransportError("protocol", `Duplicate pagination cursor on resources/list for "${server}"`);
       }
       seen.add(page.nextCursor);
       next = page.nextCursor;
     }
-    return { resources: all };
+    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on resources/list for "${server}"`);
   }
 
   async function templates(
@@ -403,7 +401,7 @@ export function createResourcesEngine(
       const all: McpResourceTemplateItem[] = [];
       const seen = new Set<string>();
       let next: string | undefined;
-      for (let i = 0; i < 32; i += 1) {
+      for (let i = 0; i < 1_000; i += 1) {
         const page = await client.request<JsonObject>(
           "resources/templates/list",
           next ? { cursor: next } : {},
@@ -415,13 +413,16 @@ export function createResourcesEngine(
             all.push(stripResourceIcons(item) as unknown as McpResourceTemplateItem);
           }
         }
-        if (typeof page.nextCursor !== "string" || !page.nextCursor || seen.has(page.nextCursor)) {
-          break;
+        if (typeof page.nextCursor !== "string" || !page.nextCursor) {
+          return { resourceTemplates: all };
+        }
+        if (seen.has(page.nextCursor)) {
+          throw new McpTransportError("protocol", `Duplicate pagination cursor on resources/templates/list for "${server}"`);
         }
         seen.add(page.nextCursor);
         next = page.nextCursor;
       }
-      return { resourceTemplates: all };
+      throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on resources/templates/list for "${server}"`);
     } catch (err) {
       if (err instanceof McpRpcError && err.code === ErrorCode.MethodNotFound) {
         return { resourceTemplates: [] };
@@ -438,17 +439,18 @@ export function createResourcesEngine(
     const client = requireClient(server);
     try {
       const result = await client.request<JsonObject>("resources/read", { uri }, toReqOpts(opts));
-      const contents = Array.isArray(result.contents) ? result.contents.filter(isRecord) : [];
-      if (contents.length === 0) {
+      if (!Array.isArray(result.contents)) {
         throw new McpTransportError(
           "protocol",
-          `MCP server "${server}" returned empty contents for resource "${uri}"`,
+          `MCP server "${server}" returned invalid resources/read response for "${uri}"`,
         );
       }
-      return {
-        contents,
-        blocks: convertResourceContentsToBlocks(server, contents),
-      };
+      const contents = result.contents.filter(isRecord);
+      const blocks = convertResourceContentsToBlocks(server, contents);
+      if (blocks.length === 0) {
+        blocks.push({ type: "text", text: "" });
+      }
+      return { contents, blocks };
     } catch (err) {
       if (err instanceof McpRpcError && (err.code === -32602 || err.code === -32002)) {
         throw new Error(`Resource not found on MCP server "${server}": ${uri} (${err.message})`);
@@ -464,7 +466,7 @@ export function createResourcesEngine(
     opts?: LogOpts,
   ): Promise<{ resources: McpResourceItem[]; nextCursor?: string }> {
     const client = requireClient(server);
-    if (client.state.skills && !client.state.skillsDirectoryRead) {
+    if (!client.state.skillsDirectoryRead) {
       throw new Error(
         `MCP server "${server}" does not advertise directoryRead: true for resources/directory/read.`,
       );
@@ -549,14 +551,26 @@ export function createResourcesEngine(
     emitState();
   }
 
+  function serverRemoved(server: string): void {
+    const conn = connections.get(server);
+    if (conn) {
+      for (const off of conn.off) {
+        try {
+          off();
+        } catch {
+          /* ignore */
+        }
+      }
+      connections.delete(server);
+    }
+    pendingUpdates.delete(server);
+    emitState();
+  }
+
   async function shutdown(): Promise<void> {
     if (shutDown) return;
     shutDown = true;
     host.signal?.removeEventListener?.("abort", onAbort);
-    if (batchTimer) {
-      clearTimeout(batchTimer);
-      batchTimer = undefined;
-    }
     flushBatch();
     for (const conn of connections.values()) {
       for (const off of conn.off) {
@@ -575,6 +589,8 @@ export function createResourcesEngine(
   return {
     restore,
     serverReady: attachServer,
+    serverRemoved,
+    flushPending: flushBatch,
     list,
     templates,
     read,
@@ -587,7 +603,12 @@ export function createResourcesEngine(
         .map(buildRecord),
     holdsSettle: () =>
       !shutDown &&
-      [...watched.values()].some((r) => r.holdSettle && Boolean(host.getClient(r.server))),
+      [...watched.values()].some(
+        (r) =>
+          r.holdSettle &&
+          Boolean(host.getClient(r.server)) &&
+          Boolean(connections.get(r.server)?.honoredUris.has(r.uri)),
+      ),
     activeWatches: () =>
       shutDown ? 0 : [...watched.values()].filter((r) => Boolean(host.getClient(r.server))).length,
     onWake: (listener: () => void) => {

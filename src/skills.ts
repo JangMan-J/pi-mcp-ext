@@ -9,11 +9,12 @@
  */
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, posix } from "node:path";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { canonicalJson } from "./events.ts";
-import { CUSTOM_SKILL_APPROVALS } from "./types.ts";
+import { createPrivateSubdir } from "./temp-files.ts";
+import { CUSTOM_SKILL_APPROVALS, McpTransportError } from "./types.ts";
 import type {
   EngineHost,
   JsonObject,
@@ -104,63 +105,16 @@ function toReqOpts(opts?: LogOpts) {
     : undefined;
 }
 
-function parseYamlScalar(raw: string): unknown {
-  const trimmed = raw.trim();
-  if (trimmed === "true") return true;
-  if (trimmed === "false") return false;
-  if (trimmed === "null" || trimmed === "~") return null;
-  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    if (trimmed.startsWith('"')) {
-      try {
-        return JSON.parse(trimmed);
-      } catch {
-        return trimmed.slice(1, -1);
-      }
-    }
-    return trimmed.slice(1, -1).replace(/''/g, "'");
-  }
-  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-    const inner = trimmed.slice(1, -1).trim();
-    if (!inner) return [];
-    return inner.split(",").map((part) => parseYamlScalar(part));
-  }
-  return trimmed;
-}
-
-/** Parse YAML frontmatter at the start of a `SKILL.md` document. */
+/** Parse YAML frontmatter at the start of a `SKILL.md` document using full YAML 1.2 parsing. */
 export function parseSkillFrontmatter(markdown: string): JsonObject | undefined {
-  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown);
-  if (!match) return undefined;
-  const lines = match[1].split(/\r?\n/);
-  const result: JsonObject = {};
-  let currentKey: string | undefined;
-  let currentArray: unknown[] | undefined;
-
-  for (const line of lines) {
-    if (!line.trim() || line.trim().startsWith("#")) continue;
-    const arrayItem = /^\s+-\s+(.*)$/.exec(line);
-    if (arrayItem && currentKey && currentArray) {
-      currentArray.push(parseYamlScalar(arrayItem[1]));
-      continue;
-    }
-    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
-    if (!kv) return undefined;
-    const [, key, rest] = kv;
-    if (rest.trim() === "") {
-      currentKey = key;
-      currentArray = [];
-      result[key] = currentArray;
-    } else {
-      currentKey = key;
-      currentArray = undefined;
-      result[key] = parseYamlScalar(rest);
-    }
+  if (!/^---\r?\n/.test(markdown)) return undefined;
+  try {
+    const { frontmatter } = parseFrontmatter<Record<string, unknown>>(markdown);
+    if (!isRecord(frontmatter) || Object.keys(frontmatter).length === 0) return undefined;
+    return frontmatter;
+  } catch {
+    return undefined;
   }
-  return result;
 }
 
 function parentSegmentOfSkillUri(uri: string): string | undefined {
@@ -171,7 +125,11 @@ function parentSegmentOfSkillUri(uri: string): string | undefined {
   // e.g. skill://code-review/SKILL.md -> segments ["code-review", "SKILL.md"]
   if (segments.length < 2) return undefined;
   if (segments[segments.length - 1] !== "SKILL.md") return undefined;
-  return decodeURIComponent(segments[segments.length - 2]);
+  try {
+    return decodeURIComponent(segments[segments.length - 2]);
+  } catch {
+    return undefined;
+  }
 }
 
 function skillRootPrefix(skillUri: string): string {
@@ -179,16 +137,34 @@ function skillRootPrefix(skillUri: string): string {
   return idx >= 0 ? skillUri.slice(0, idx) : skillUri;
 }
 
+function isWithinSkillRoot(skillUri: string, targetUri: string): boolean {
+  if (targetUri === skillUri) return true;
+  const root = skillRootPrefix(skillUri);
+  if (!targetUri.startsWith(`${root}/`)) return false;
+  const rel = targetUri.slice(root.length + 1);
+  if (!rel || rel.split("/").some((seg) => seg === ".." || seg === "." || seg.length === 0)) {
+    return false;
+  }
+  return true;
+}
+
 function resolveSkillChildUri(skillUri: string, ref: string): string {
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(ref)) {
+    if (!isWithinSkillRoot(skillUri, ref)) {
+      throw new Error(`Skill file URI "${ref}" is outside skill root "${skillRootPrefix(skillUri)}"`);
+    }
     return ref;
   }
   const root = skillRootPrefix(skillUri);
   const normalizedRel = posix.normalize(ref).replace(/^\/+/, "");
-  if (normalizedRel.startsWith("..")) {
+  if (!normalizedRel || normalizedRel === "." || normalizedRel.startsWith("..")) {
     throw new Error(`Relative skill path "${ref}" escapes skill root`);
   }
-  return `${root}/${normalizedRel}`;
+  const resolved = `${root}/${normalizedRel}`;
+  if (!isWithinSkillRoot(skillUri, resolved)) {
+    throw new Error(`Skill file URI "${resolved}" escapes skill root`);
+  }
+  return resolved;
 }
 
 function parseSkillEntry(raw: unknown): SkillEntry {
@@ -237,6 +213,9 @@ function parseSkillEntry(raw: unknown): SkillEntry {
       item.size < 0
     ) {
       throw new Error(`Invalid manifest item in MCP skill "${raw.uri}"`);
+    }
+    if (!isWithinSkillRoot(raw.uri, item.uri)) {
+      throw new Error(`Invalid manifest item "${item.uri}" outside skill root "${skillRootPrefix(raw.uri)}"`);
     }
     totalBytes += item.size;
     if (totalBytes > MAX_SKILL_BYTES) {
@@ -291,13 +270,17 @@ function writeReadOnlyFile(filePath: string, bytes: Buffer): void {
 
 export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
   const retained = new Map<string, SkillEntry>(); // key: `${server}\0${uri}`
+  const loadedSkills = new Set<string>(); // key: `${server}\0${uri}`
   const approvedFingerprints = new Set<string>();
-  const verifiedDirs = new Map<string, { dir: string; expectedDigest: string; skillMdPath: string }>();
-  const cacheRoot = join(
-    tmpdir(),
-    `pi-mcp-ext-skills-${process.getuid?.() ?? process.pid}-${shortHash(String(process.pid))}`,
-  );
+  let cacheRoot: string | undefined;
   let shutDown = false;
+
+  function getCacheRoot(): string {
+    if (!cacheRoot) {
+      cacheRoot = createPrivateSubdir("skills");
+    }
+    return cacheRoot;
+  }
 
   const entryKey = (server: string, uri: string) => `${server}\0${uri}`;
   const onAbort = () => void shutdown();
@@ -332,7 +315,7 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
     const seen = new Set<string>();
     let cursor: string | undefined;
     const reqOpts = toReqOpts(opts);
-    for (let page = 0; page < 32; page += 1) {
+    for (let page = 0; page < 1_000; page += 1) {
       const res = await client.request<JsonObject>(
         "skills/list",
         cursor ? { cursor } : {},
@@ -340,17 +323,24 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
       );
       const rawSkills = Array.isArray(res.skills) ? res.skills : [];
       for (const raw of rawSkills) {
-        const entry = parseSkillEntry(raw);
-        retained.set(entryKey(server, entry.uri), entry);
-        out.push(entry);
+        try {
+          const entry = parseSkillEntry(raw);
+          retained.set(entryKey(server, entry.uri), entry);
+          out.push(entry);
+        } catch (err) {
+          host.log("warn", `[${server}] Skipping invalid MCP skill entry: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
-      if (typeof res.nextCursor !== "string" || !res.nextCursor || seen.has(res.nextCursor)) {
-        break;
+      if (typeof res.nextCursor !== "string" || !res.nextCursor) {
+        return out;
+      }
+      if (seen.has(res.nextCursor)) {
+        throw new McpTransportError("protocol", `Duplicate pagination cursor on skills/list for "${server}"`);
       }
       seen.add(res.nextCursor);
       cursor = res.nextCursor;
     }
-    return out;
+    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on skills/list for "${server}"`);
   }
 
   async function get(server: string, uri: string, opts?: LogOpts): Promise<SkillEntry> {
@@ -383,6 +373,7 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
   }
 
   async function refreshOnVerificationFailure(server: string, uri: string): Promise<void> {
+    loadedSkills.delete(entryKey(server, uri));
     try {
       await get(server, uri);
     } catch {
@@ -408,7 +399,12 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
 
     const fp = approvalFingerprint(server, entry);
     const alreadyApproved = fp !== undefined && approvedFingerprints.has(fp);
-    if (!alreadyApproved && opts?.approve) {
+    if (!alreadyApproved) {
+      if (!opts?.approve) {
+        throw new Error(
+          `Cannot load unapproved MCP skill "${entry.frontmatter.name}" from "${server}": interactive user approval is required.`,
+        );
+      }
       const fileCount = entry.resources === "dynamic" ? "dynamic" : entry.resources.length;
       const totalBytes =
         entry.resources === "dynamic"
@@ -466,17 +462,12 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
 
     let cacheDir: string | undefined;
     if (entry.resources !== "dynamic") {
-      const skillParent = join(cacheRoot, shortHash(server), shortHash(entry.uri), entry.frontmatter.name);
+      const skillParent = join(getCacheRoot(), shortHash(server), shortHash(entry.uri), entry.frontmatter.name);
       const skillMdPath = join(skillParent, "SKILL.md");
       writeReadOnlyFile(skillMdPath, bytes);
-      const digest = sha256Digest(bytes);
-      verifiedDirs.set(k, {
-        dir: dirname(skillParent),
-        expectedDigest: digest,
-        skillMdPath,
-      });
       cacheDir = skillParent;
     }
+    loadedSkills.add(k);
 
     const supportingUris =
       entry.resources === "dynamic"
@@ -504,9 +495,9 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
     const client = requireSkillsClient(server);
     const k = entryKey(server, skillUri);
     const entry = retained.get(k);
-    if (!entry) {
+    if (!entry || !loadedSkills.has(k)) {
       throw new Error(
-        `MCP skill "${skillUri}" on server "${server}" must be loaded before reading supporting files.`,
+        `MCP skill "${skillUri}" on server "${server}" must be approved and loaded before reading supporting files.`,
       );
     }
     const targetUri = resolveSkillChildUri(skillUri, fileUriOrRelativePath);
@@ -603,38 +594,24 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
   }
 
   function verifiedSkillPaths(): string[] {
-    if (shutDown) return [];
-    const paths: string[] = [];
-    for (const [k, item] of verifiedDirs) {
-      try {
-        const st = statSync(item.skillMdPath);
-        if (!st.isFile()) {
-          verifiedDirs.delete(k);
-          continue;
-        }
-        const bytes = readFileSync(item.skillMdPath);
-        if (sha256Digest(bytes) !== item.expectedDigest) {
-          verifiedDirs.delete(k);
-          continue;
-        }
-        paths.push(item.dir);
-      } catch {
-        verifiedDirs.delete(k);
-      }
-    }
-    return [...new Set(paths)];
+    // Per `extensions/skills/overview.md` §Integrity and Verification:
+    // "Hosts MUST exclude cached files from filesystem-skill discovery paths and preserve their MCP origin".
+    return [];
   }
 
   async function shutdown(): Promise<void> {
     if (shutDown) return;
     shutDown = true;
     host.signal?.removeEventListener?.("abort", onAbort);
-    verifiedDirs.clear();
+    loadedSkills.clear();
     retained.clear();
-    try {
-      rmSync(cacheRoot, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+    if (cacheRoot) {
+      try {
+        rmSync(cacheRoot, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+      cacheRoot = undefined;
     }
   }
 

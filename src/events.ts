@@ -4,15 +4,14 @@
  * Depends only on EngineHost/ServerClient from types.ts.
  */
 
-import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
+import { writePrivateTempFile } from "./temp-files.ts";
 import {
   CUSTOM_CURSORS,
   CUSTOM_SUBSCRIPTIONS,
   ErrorCode,
   MESSAGE_EVENT,
+  McpTransportError,
 } from "./types.ts";
 import type {
   CursorEntry,
@@ -63,6 +62,10 @@ function escapeAttr(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function escapeXmlCloseTags(value: string): string {
+  return value.replace(/<\/(mcp_[a-zA-Z0-9_]*)/gi, "<\\/$1");
+}
+
 /**
  * Frame deliveries as untrusted external data: one `<mcp_event ...>` tag per occurrence with a
  * JSON body (head-truncated; the full payload goes to a temp file when truncated), preceded by a
@@ -80,11 +83,10 @@ export function formatEventDeliveries(batch: EventDelivery[]): string {
     for (const occ of delivery.occurrences) {
       const full = JSON.stringify(occ.data ?? {}, null, 2);
       const truncated = truncateHead(full, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
-      let body = truncated.content;
+      let body = escapeXmlCloseTags(truncated.content);
       if (truncated.truncated) {
         try {
-          const file = join(tmpdir(), `pi-mcp-event-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.json`);
-          writeFileSync(file, full);
+          const file = writePrivateTempFile("mcp-event", "json", full);
           body += `\n[truncated: full payload written to ${file}]`;
         } catch {
           body += `\n[truncated]`;
@@ -117,6 +119,7 @@ interface Sub {
   generation: number;
   stream?: OpenStreamHandle;
   streamGen: number;
+  effectiveWatchdogMs: number;
   watchdogTimer?: ReturnType<typeof setTimeout>;
   pollTimer?: ReturnType<typeof setTimeout>;
   reconnectTimer?: ReturnType<typeof setTimeout>;
@@ -149,7 +152,7 @@ export function createEventsEngine(
 ): EventsEngineApi {
   const pollFloorMs = opts?.pollFloorMs ?? 1000;
   const batchWindowMs = opts?.batchWindowMs ?? 75;
-  const watchdogMs = opts?.watchdogMs ?? 65000;
+  const watchdogMs = opts?.watchdogMs ?? 90000;
   const checkpointMs = opts?.checkpointMs ?? 30000;
 
   const subs = new Map<string, Sub>();
@@ -159,7 +162,7 @@ export function createEventsEngine(
   const persistedCursors = new Map<string, string>();
   /** Newest recentEventIds per subKey, from restored entries. */
   const persistedRecent = new Map<string, string[]>();
-  const listenDisposers = new Map<string, () => void>();
+  const listenDisposers = new Map<string, { client: ServerClient; dispose: () => void }>();
   const wakeListeners = new Set<() => void>();
   const stateListeners = new Set<() => void>();
   const pendingBatch = new Map<string, EventDelivery>();
@@ -185,15 +188,25 @@ export function createEventsEngine(
   }
 
   function flushBatch(): void {
-    batchTimer = undefined;
+    if (batchTimer) {
+      clearTimeout(batchTimer);
+      batchTimer = undefined;
+    }
     if (!pendingBatch.size) return;
     const batch = [...pendingBatch.values()];
     pendingBatch.clear();
     emitWake(formatEventDeliveries(batch), { deliveries: batch });
+    for (const delivery of batch) {
+      const sub = subs.get(delivery.subKey);
+      if (sub && sub.dirtyCursor) {
+        persistCursor(sub);
+      }
+    }
   }
 
   function enqueueDelivery(sub: Sub, occurrences: EventOccurrence[], truncated: boolean): void {
     const key = sub.record.subKey;
+    sub.dirtyCursor = true;
     const existing = pendingBatch.get(key);
     if (existing) {
       existing.occurrences.push(...occurrences);
@@ -212,7 +225,7 @@ export function createEventsEngine(
 
   function wakeNotice(sub: Sub, message: string): void {
     emitWake(
-      `<mcp_event_notice server="${escapeAttr(sub.record.server)}" name="${escapeAttr(sub.record.name)}">${message}</mcp_event_notice>`,
+      `<mcp_event_notice server="${escapeAttr(sub.record.server)}" name="${escapeAttr(sub.record.name)}">${escapeAttr(message)}</mcp_event_notice>`,
       { deliveries: [], notice: message, server: sub.record.server, name: sub.record.name, subKey: sub.record.subKey },
     );
   }
@@ -278,7 +291,10 @@ export function createEventsEngine(
   // ---- events/list --------------------------------------------------------------
 
   function ensureListen(server: string, client: ServerClient): void {
-    if (listenDisposers.has(server)) return;
+    const existing = listenDisposers.get(server);
+    if (existing?.client === client) return;
+    existing?.dispose();
+    listenDisposers.delete(server);
     if (!client.state?.eventsListChanged) return;
     client.setListenInterest("events", { eventsListChanged: true });
     const dispose = client.onListenNotification((msg: JSONRPCNotification) => {
@@ -287,7 +303,7 @@ export function createEventsEngine(
         void list(server).catch(err => host.log("warn", `events/list refresh for ${server} failed: ${errorMessageOf(err)}`));
       }
     });
-    listenDisposers.set(server, dispose);
+    listenDisposers.set(server, { client, dispose });
   }
 
   async function fetchList(
@@ -301,7 +317,7 @@ export function createEventsEngine(
     const reqOpts = opts?.logLevel || opts?.onLog
       ? { ...(opts.logLevel ? { logLevel: opts.logLevel } : {}), ...(opts.onLog ? { onLog: opts.onLog } : {}) }
       : undefined;
-    for (let page = 0; page < 32; page++) {
+    for (let page = 0; page < 1_000; page++) {
       const result = await client.request<ListEventsResult>(
         "events/list",
         cursor ? { cursor } : {},
@@ -309,12 +325,17 @@ export function createEventsEngine(
       );
       events.push(...(result.events ?? []));
       const next = result.nextCursor;
-      if (!next || seenCursors.has(next)) break;
+      if (!next) {
+        descriptorCache.set(server, events);
+        return events;
+      }
+      if (seenCursors.has(next)) {
+        throw new McpTransportError("protocol", `Duplicate pagination cursor on events/list for "${server}"`);
+      }
       seenCursors.add(next);
       cursor = next;
     }
-    descriptorCache.set(server, events);
-    return events;
+    throw new McpTransportError("protocol", `Pagination limit (1000 pages) exceeded on events/list for "${server}"`);
   }
 
   async function list(
@@ -382,13 +403,19 @@ export function createEventsEngine(
       const truncated = result.truncated === true;
       if (accepted.length || truncated) {
         enqueueDelivery(sub, accepted, truncated);
-        persistCursor(sub);
       } else if (cursorChanged) {
         markCursorQuiet(sub);
       }
-      if (!result.hasMore) return result;
-      if (shutDown || sub.stopped || sub.generation !== gen) return result;
+      if (!result.hasMore) {
+        flushBatch();
+        return result;
+      }
+      if (shutDown || sub.stopped || sub.generation !== gen) {
+        flushBatch();
+        return result;
+      }
     }
+    flushBatch();
     return last; // 50 pages drained; caller yields before continuing
   }
 
@@ -432,7 +459,7 @@ export function createEventsEngine(
           await openPush(sub).catch(err => host.log("warn", `events/stream reconnect failed: ${errorMessageOf(err)}`));
         }
       })();
-    }, watchdogMs);
+    }, sub.effectiveWatchdogMs);
   }
 
   function scheduleReconnect(sub: Sub): void {
@@ -469,6 +496,8 @@ export function createEventsEngine(
     sub.stream = undefined;
     if (handle) void handle.cancel("terminated").catch(() => {});
     persistCursor(sub); // termination flush
+    const removeEntry: SubscriptionEntry = { op: "remove", subKey: sub.record.subKey, server: sub.record.server };
+    host.appendEntry(CUSTOM_SUBSCRIPTIONS, removeEntry);
     if (code === ErrorCode.NotFound || code === ErrorCode.Unsupported) {
       descriptorCache.delete(sub.record.server);
       void list(sub.record.server).catch(e => host.log("warn", `events/list refresh failed: ${errorMessageOf(e)}`));
@@ -502,11 +531,14 @@ export function createEventsEngine(
     const params = (msg.params ?? {}) as Record<string, unknown>;
     switch (msg.method) {
       case "notifications/events/active": {
+        if (typeof params.heartbeatMs === "number" && Number.isFinite(params.heartbeatMs) && params.heartbeatMs > 0) {
+          sub.effectiveWatchdogMs = Math.max(10, Math.round(params.heartbeatMs * 3));
+          armWatchdog(sub, streamGen);
+        }
         const changed = setCursor(sub, params.cursor as string | null | undefined);
         const truncated = params.truncated === true;
         if (truncated) {
           enqueueDelivery(sub, [], true);
-          persistCursor(sub);
         } else if (changed) {
           persistCursor(sub); // activation persists the fresh cursor
         }
@@ -518,7 +550,6 @@ export function createEventsEngine(
         const accepted = acceptOccurrences(sub, [occ], true);
         if (accepted.length) {
           enqueueDelivery(sub, accepted, false);
-          persistCursor(sub);
         } else if (sub.cursor !== before) {
           markCursorQuiet(sub);
         }
@@ -596,6 +627,7 @@ export function createEventsEngine(
       return;
     }
     sub.stream = handle;
+    sub.effectiveWatchdogMs = watchdogMs;
     sub.backoffMs = 250;
     emitStateChange();
     armWatchdog(sub, streamGen);
@@ -639,6 +671,7 @@ export function createEventsEngine(
       stopped: false,
       generation: 0,
       streamGen: 0,
+      effectiveWatchdogMs: watchdogMs,
       backoffMs: 250,
       dirtyCursor: false,
       lastFlushAt: 0,
@@ -741,6 +774,28 @@ export function createEventsEngine(
     }
   }
 
+  function serverRemoved(server: string): void {
+    const ld = listenDisposers.get(server);
+    if (ld) {
+      ld.dispose();
+      listenDisposers.delete(server);
+    }
+    descriptorCache.delete(server);
+    inflightLists.delete(server);
+    for (const sub of subs.values()) {
+      if (sub.record.server === server && !sub.stopped) {
+        sub.started = false;
+        sub.streamGen++;
+        clearWatchdog(sub);
+        if (sub.pollTimer) { clearTimeout(sub.pollTimer); sub.pollTimer = undefined; }
+        if (sub.reconnectTimer) { clearTimeout(sub.reconnectTimer); sub.reconnectTimer = undefined; }
+        const handle = sub.stream;
+        sub.stream = undefined;
+        if (handle) void handle.cancel("server removed").catch(() => {});
+      }
+    }
+    emitStateChange();
+  }
   function serverReady(server: string): void {
     const client = host.getClient(server);
     if (client) ensureListen(server, client);
@@ -853,9 +908,8 @@ export function createEventsEngine(
     if (shutDown) return;
     shutDown = true;
     host.signal?.removeEventListener?.("abort", onAbort);
-    if (batchTimer) { clearTimeout(batchTimer); batchTimer = undefined; }
     flushBatch();
-    for (const dispose of listenDisposers.values()) { try { dispose(); } catch { /* ignore */ } }
+    for (const ld of listenDisposers.values()) { try { ld.dispose(); } catch { /* ignore */ } }
     listenDisposers.clear();
     inflightLists.clear();
     await Promise.all([...subs.values()].map(sub => stopSub(sub))); // stopSub flushes dirty cursors
@@ -865,6 +919,7 @@ export function createEventsEngine(
   return {
     restore,
     serverReady,
+    serverRemoved,
     list,
     subscribe,
     unsubscribe,
@@ -876,6 +931,7 @@ export function createEventsEngine(
         ...(sub.mode ? { mode: sub.mode } : {}),
       })),
     poll,
+    flushPending: flushBatch,
     holdsSettle: () => [...subs.values()].some(sub => sub.record.holdSettle && isActive(sub)),
     activeStreams: () => [...subs.values()].filter(sub => sub.stream !== undefined).length,
     onWake: (listener: () => void) => {

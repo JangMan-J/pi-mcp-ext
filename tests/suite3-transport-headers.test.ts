@@ -27,6 +27,9 @@ test('Transport & Header Compliance Check: real POST, SSE, header recovery, retr
   try {
     for(const method of ['tasks/get','tasks/update','tasks/cancel']) await client.request(method,{taskId:'task'});
     for(const name of ['event','é',' leading','=?base64?abc?=']) for(const method of ['events/poll','events/stream']) await client.request(method,{name});
+    await client.request('prompts/get',{name:'review-prompt'});
+    await client.request('resources/read',{uri:'skill://code-audit/SKILL.md'});
+    await client.request('resources/directory/read',{uri:'skill://code-audit'});
     await client.request('tools/call',{name:'tool',arguments:{region:'é'}});
     assert.equal(calls,2);
     assert.equal(server.requests.findLast((r:any)=>r.body.method==='tools/call').headers['mcp-param-region'],'=?base64?w6k=?=');
@@ -42,7 +45,7 @@ test('Transport & Header Compliance Check: real POST, SSE, header recovery, retr
       assert.equal(r.headers['mcp-protocol-version'],r.body.params._meta[META_PROTOCOL_VERSION]);
       assert.equal(r.headers['mcp-method'],r.body.method);
       assert.equal(r.headers['mcp-session-id'],undefined); assert.equal(r.headers['last-event-id'],undefined);
-      const source=r.body.params.taskId ?? r.body.params.name;
+      const source=r.body.params.taskId ?? r.body.params.name ?? r.body.params.uri;
       assert.equal(r.headers['mcp-name'],source===undefined?undefined:encodeHeaderValue(source));
       if(source==='é') assert.equal(r.headers['mcp-name'],'=?base64?w6k=?=');
       if(source===' leading') assert.equal(r.headers['mcp-name'],'=?base64?IGxlYWRpbmc=?=');

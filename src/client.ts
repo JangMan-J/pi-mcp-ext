@@ -1,5 +1,5 @@
-import { resolveConfigValue } from "./config.ts";
-import { collectXMcpHeaders, createHttpTransport, paramHeaders } from "./transport-http.ts";
+import { resolveConfigValueAsync } from "./config.ts";
+import { createHttpTransport, paramHeaders, validateXMcpHeaders } from "./transport-http.ts";
 import { createStdioTransport } from "./transport-stdio.ts";
 import {
   CLIENT_INFO,
@@ -98,7 +98,16 @@ export interface ClientDeps {
   meta?: () => Record<string, unknown>;
   log?: (level: "info" | "warn" | "error", msg: string) => void;
   backoff?: { baseMs?: number; maxMs?: number };
+  listenAckTimeoutMs?: number;
+  autoParkIdleStdio?: () => boolean;
+  fulfillInputRequests?: (
+    server: string,
+    inputRequests: Record<string, { method: string; params?: JsonObject }>,
+  ) => Promise<JsonObject | undefined>;
 }
+
+const MAX_PAGINATION_PAGES = 1_000;
+const MAX_MRTR_ROUNDS = 8;
 
 type HeaderDescriptor = { header: string; path: string[] };
 
@@ -108,6 +117,7 @@ type ListenAttempt = {
   key: string;
   transport?: Mcp2026Transport;
   handle?: OpenStreamHandle;
+  ackTimer?: ReturnType<typeof setTimeout>;
   acknowledged: boolean;
   retired: boolean;
   finished: boolean;
@@ -151,9 +161,20 @@ function supportedVersions(value: unknown): string[] | undefined {
 }
 
 function isDiscoverResult(result: JsonObject): result is JsonObject & DiscoverResult {
-  return result.resultType === "complete"
+  return (result.resultType === "complete" || result.resultType === undefined)
     && Array.isArray(result.supportedVersions)
     && result.supportedVersions.every(version => typeof version === "string");
+}
+
+function isPermanentListenError(err: unknown): boolean {
+  if (!(err instanceof McpRpcError)) return false;
+  return (
+    err.code === ErrorCode.MethodNotFound
+    || err.code === ErrorCode.MissingRequiredClientCapability
+    || err.code === ErrorCode.UnsupportedProtocolVersion
+    || err.code === ErrorCode.Forbidden
+    || err.code === ErrorCode.Unsupported
+  );
 }
 
 /** Create one lazy, per-server protocol client. */
@@ -171,12 +192,18 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
   const baseBackoff = deps.backoff?.baseMs ?? 500;
   const maxBackoff = deps.backoff?.maxMs ?? 30_000;
 
+  const listenAckTimeoutMs = deps.listenAckTimeoutMs ?? 15_000;
+
   let sequence = 0;
   let transportPromise: Promise<Mcp2026Transport> | undefined;
   let currentTransport: Mcp2026Transport | undefined;
   let removeCloseListener: (() => void) | undefined;
   let closed = false;
   let closePromise: Promise<void> | undefined;
+  let inFlightCount = 0;
+  let openUserStreams = 0;
+  let idleParkTimer: ReturnType<typeof setTimeout> | undefined;
+  let listenUnsupported = false;
 
   const owners = new Map<ListenOwner, ListenFilter>();
   const notificationListeners = new Set<(msg: JSONRPCNotification) => void>();
@@ -187,6 +214,34 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
   let pending: ListenAttempt | undefined;
   let reconnectTimer: NodeJS.Timeout | undefined;
   let nextBackoff = baseBackoff;
+
+  function clearIdleParkTimer(): void {
+    if (idleParkTimer) {
+      clearTimeout(idleParkTimer);
+      idleParkTimer = undefined;
+    }
+  }
+
+  function scheduleIdleStdioParkIfEligible(): void {
+    clearIdleParkTimer();
+    if (
+      closed
+      || config.transport !== "stdio"
+      || !deps.autoParkIdleStdio?.()
+      || inFlightCount > 0
+      || openUserStreams > 0
+      || desiredKey !== "{}"
+      || active
+      || pending
+    ) {
+      return;
+    }
+    idleParkTimer = setTimeout(() => {
+      idleParkTimer = undefined;
+      void park();
+    }, 250);
+    idleParkTimer.unref?.();
+  }
 
   function nextId(prefix: string): string {
     sequence += 1;
@@ -200,9 +255,9 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     logLevel?: McpLogLevel,
   ): JSONRPCRequest {
     const requestParams: JsonObject = { ...params };
-    const meta: JsonObject = { ...makeMeta(), ...(params?._meta as JsonObject | undefined) };
-    // Always enforce protocol fields while allowing caller-supplied traceparent/progressToken in params._meta.
     const coreMeta = makeMeta();
+    const meta: JsonObject = { ...coreMeta, ...(params?._meta as JsonObject | undefined) };
+    // Always enforce protocol fields while allowing caller-supplied traceparent/progressToken in params._meta.
     meta[META_PROTOCOL_VERSION] = coreMeta[META_PROTOCOL_VERSION];
     meta[META_CLIENT_CAPABILITIES] = coreMeta[META_CLIENT_CAPABILITIES];
     meta[META_CLIENT_INFO] = coreMeta[META_CLIENT_INFO];
@@ -213,11 +268,11 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
 
   async function defaultTransport(): Promise<Mcp2026Transport> {
     if (config.transport === "stdio") {
-      return createStdioTransport(config, { cwd: deps.cwd, resolveValue: resolveConfigValue });
+      return createStdioTransport(config, { cwd: deps.cwd, resolveValue: resolveConfigValueAsync });
     }
     return createHttpTransport(config, {
       auth: deps.auth ?? noAuth,
-      resolveValue: resolveConfigValue,
+      resolveValue: resolveConfigValueAsync,
     });
   }
 
@@ -312,27 +367,68 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     };
   }
 
+  const toolHeaders = new Map<string, HeaderDescriptor[]>();
+  let toolHeaderListing: Promise<void> | undefined;
+
+  function recordToolsPage(tools: unknown): void {
+    if (!Array.isArray(tools)) return;
+    for (const tool of tools) {
+      if (typeof tool !== "object" || tool === null) continue;
+      const name = (tool as JsonObject).name;
+      if (typeof name !== "string") continue;
+      const validated = validateXMcpHeaders((tool as JsonObject).inputSchema);
+      if (validated.valid) {
+        toolHeaders.set(name, validated.headers);
+      } else {
+        toolHeaders.delete(name);
+        log("warn", `[${config.name}] Ignoring invalid x-mcp-header on tool "${name}": ${validated.reason}`);
+      }
+    }
+  }
+
   async function rawRequest<T = JsonObject>(
     method: string,
     params?: JsonObject,
     opts?: ClientRequestOptions,
   ): Promise<T> {
-    const transport = await getTransport();
-    const response = await transport.request(
-      requestMessage(method, params, nextId("request"), opts?.logLevel),
-      {
-        signal: opts?.signal,
-        timeoutMs: opts?.timeoutMs ?? config.timeoutMs,
-        onNotification: wrapRequestNotifications(opts?.onNotification, opts?.onLog),
-        headers: opts?.headers,
-      },
-    );
-    if (isErrorResponse(response)) throw new McpRpcError(response.error);
-    return response.result as T;
+    clearIdleParkTimer();
+    inFlightCount += 1;
+    try {
+      const transport = await getTransport();
+      const response = await transport.request(
+        requestMessage(method, params, nextId("request"), opts?.logLevel),
+        {
+          signal: opts?.signal,
+          timeoutMs: opts?.timeoutMs ?? config.timeoutMs,
+          onNotification: wrapRequestNotifications(opts?.onNotification, opts?.onLog),
+          headers: opts?.headers,
+        },
+      );
+      if (isErrorResponse(response)) throw new McpRpcError(response.error);
+      const resObj = response.result;
+      if (typeof resObj === "object" && resObj !== null && !Array.isArray(resObj)) {
+        const rt = (resObj as JsonObject).resultType;
+        if (
+          rt !== undefined
+          && rt !== "complete"
+          && rt !== "input_required"
+          && !(rt === "task" && method === "tools/call")
+        ) {
+          throw new McpTransportError(
+            "protocol",
+            `Unexpected MCP resultType "${String(rt)}" for method "${method}"`,
+          );
+        }
+        if (method === "tools/list") {
+          recordToolsPage((resObj as JsonObject).tools);
+        }
+      }
+      return resObj as T;
+    } finally {
+      inFlightCount -= 1;
+      scheduleIdleStdioParkIfEligible();
+    }
   }
-
-  const toolHeaders = new Map<string, HeaderDescriptor[]>();
-  let toolHeaderListing: Promise<void> | undefined;
 
   async function cacheToolHeaders(): Promise<void> {
     if (toolHeaderListing) return toolHeaderListing;
@@ -340,21 +436,16 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       toolHeaders.clear();
       let cursor: string | undefined;
       const seen = new Set<string>();
-      for (let page = 0; page < 32; page += 1) {
+      for (let page = 0; page < MAX_PAGINATION_PAGES; page += 1) {
         const result = await rawRequest<JsonObject>("tools/list", cursor ? { cursor } : undefined);
-        if (Array.isArray(result.tools)) {
-          for (const tool of result.tools) {
-            if (typeof tool !== "object" || tool === null) continue;
-            const name = (tool as JsonObject).name;
-            if (typeof name === "string") {
-              toolHeaders.set(name, collectXMcpHeaders((tool as JsonObject).inputSchema));
-            }
-          }
+        if (typeof result.nextCursor !== "string" || !result.nextCursor) return;
+        if (seen.has(result.nextCursor)) {
+          throw new McpTransportError("protocol", `Duplicate pagination cursor on tools/list for "${config.name}"`);
         }
-        if (typeof result.nextCursor !== "string" || seen.has(result.nextCursor)) break;
         seen.add(result.nextCursor);
         cursor = result.nextCursor;
       }
+      throw new McpTransportError("protocol", `Pagination limit (${MAX_PAGINATION_PAGES} pages) exceeded on tools/list`);
     })().finally(() => {
       toolHeaderListing = undefined;
     });
@@ -373,7 +464,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     return { ...supplied, ...paramHeaders(descriptors, args) };
   }
 
-  async function request<T = JsonObject>(
+  async function requestOnce<T = JsonObject>(
     method: string,
     params?: JsonObject,
     opts?: ClientRequestOptions,
@@ -392,7 +483,62 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     }
   }
 
+  const MRTR_METHODS = new Set(["tools/call", "resources/read", "prompts/get"]);
+
+  async function request<T = JsonObject>(
+    method: string,
+    params?: JsonObject,
+    opts?: ClientRequestOptions,
+  ): Promise<T> {
+    const baseParams: JsonObject = { ...params };
+    let currentParams: JsonObject | undefined = params;
+    for (let round = 0; round <= MAX_MRTR_ROUNDS; round += 1) {
+      const result = await requestOnce<T>(method, currentParams, opts);
+      const asObj = typeof result === "object" && result !== null ? (result as unknown as JsonObject) : undefined;
+      if (asObj?.resultType !== "input_required") {
+        return result;
+      }
+      if (!MRTR_METHODS.has(method)) {
+        throw new McpTransportError("protocol", `Method "${method}" cannot return resultType: "input_required"`);
+      }
+      if (!deps.fulfillInputRequests) {
+        return result;
+      }
+      const rawRequests = asObj.inputRequests;
+      if (typeof rawRequests !== "object" || rawRequests === null || Array.isArray(rawRequests)) {
+        throw new McpTransportError("protocol", "Invalid inputRequests in input_required result");
+      }
+      const entries = Object.entries(rawRequests as Record<string, unknown>);
+      if (entries.length === 0) {
+        throw new McpTransportError("protocol", "Empty inputRequests in input_required result");
+      }
+      const validatedReqs: Record<string, { method: string; params?: JsonObject }> = {};
+      for (const [reqKey, val] of entries) {
+        if (typeof val !== "object" || val === null || typeof (val as JsonObject).method !== "string") {
+          throw new McpTransportError("protocol", `Invalid inputRequest entry "${reqKey}"`);
+        }
+        validatedReqs[reqKey] = {
+          method: (val as JsonObject).method as string,
+          params: typeof (val as JsonObject).params === "object" && (val as JsonObject).params !== null
+            ? ((val as JsonObject).params as JsonObject)
+            : undefined,
+        };
+      }
+      const inputResponses = await deps.fulfillInputRequests(config.name, validatedReqs);
+      if (!inputResponses) {
+        throw new Error(`MCP server "${config.name}" requested client input that could not be fulfilled`);
+      }
+      currentParams = {
+        ...baseParams,
+        inputResponses,
+        ...(asObj.requestState !== undefined ? { requestState: asObj.requestState } : {}),
+      };
+    }
+    throw new McpTransportError("protocol", `Exceeded maximum MRTR input_required rounds (${MAX_MRTR_ROUNDS})`);
+  }
+
   function clearCapabilities(): void {
+    listenUnsupported = false;
     state.error = undefined;
     state.supportedVersions = undefined;
     state.events = false;
@@ -537,20 +683,28 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
   }
 
   function scheduleReconnect(): void {
-    if (closed || reconnectTimer || desiredKey === "{}" || pending || active) return;
+    if (closed || listenUnsupported || reconnectTimer || desiredKey === "{}" || pending || active) return;
     const delay = nextBackoff;
     nextBackoff = Math.min(maxBackoff, Math.max(baseBackoff, nextBackoff * 2));
     const jittered = Math.max(0, Math.round(delay * (0.8 + Math.random() * 0.4)));
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
-      if (!closed && desiredKey !== "{}" && !active && !pending) startAttempt(desired, desiredKey);
+      if (!closed && !listenUnsupported && desiredKey !== "{}" && !active && !pending) startAttempt(desired, desiredKey);
     }, jittered);
     reconnectTimer.unref?.();
+  }
+
+  function clearAckTimer(attempt: ListenAttempt | undefined): void {
+    if (attempt?.ackTimer) {
+      clearTimeout(attempt.ackTimer);
+      attempt.ackTimer = undefined;
+    }
   }
 
   function cancelAttempt(attempt: ListenAttempt | undefined, reason: string): void {
     if (!attempt) return;
     attempt.retired = true;
+    clearAckTimer(attempt);
     if (attempt.handle && !attempt.cancelSent) {
       attempt.cancelSent = true;
       void attempt.handle.cancel(reason).catch(() => {});
@@ -560,10 +714,12 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
   function dropActive(attempt: ListenAttempt, notify = true): void {
     if (active !== attempt) return;
     active = undefined;
+    clearAckTimer(attempt);
     if (notify && attempt.acknowledged) emitListenState(undefined);
   }
 
   function streamFinished(attempt: ListenAttempt, _result: JSONRPCResultResponse | undefined): void {
+    clearAckTimer(attempt);
     if (attempt.finished || attempt.retired) return;
     attempt.finished = true;
     if (pending === attempt) {
@@ -589,6 +745,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     if (!attempt.acknowledged) {
       if (msg.method !== "notifications/subscriptions/acknowledged") return;
       attempt.acknowledged = true;
+      clearAckTimer(attempt);
       nextBackoff = baseBackoff;
       const honored = normalizeFilter((msg.params?.notifications as ListenFilter | undefined) ?? {});
       if (pending === attempt) {
@@ -610,7 +767,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
   }
 
   function startAttempt(filter: ListenFilter, key: string): void {
-    if (closed || key === "{}") return;
+    if (closed || listenUnsupported || key === "{}") return;
     const attempt: ListenAttempt = {
       id: nextId("listen"),
       filter: { ...filter, taskIds: filter.taskIds ? [...filter.taskIds] : undefined },
@@ -621,6 +778,15 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       cancelSent: false,
     };
     pending = attempt;
+    attempt.ackTimer = setTimeout(() => {
+      attempt.ackTimer = undefined;
+      if (!attempt.acknowledged && !attempt.retired && !attempt.finished) {
+        cancelAttempt(attempt, "listen acknowledgment timeout");
+        attempt.retired = false;
+        streamFinished(attempt, undefined);
+      }
+    }, listenAckTimeoutMs);
+    attempt.ackTimer.unref?.();
     void (async () => {
       try {
         const transport = await getTransport();
@@ -637,9 +803,19 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
         }
         void handle.done.then(
           result => streamFinished(attempt, result),
-          () => streamFinished(attempt, undefined),
+          err => {
+            if (isPermanentListenError(err)) {
+              listenUnsupported = true;
+              log("info", `[${config.name}] subscriptions/listen unsupported (${errorMessage(err)}); falling back`);
+            }
+            streamFinished(attempt, undefined);
+          },
         );
-      } catch {
+      } catch (err) {
+        if (isPermanentListenError(err)) {
+          listenUnsupported = true;
+          log("info", `[${config.name}] subscriptions/listen unsupported (${errorMessage(err)}); falling back`);
+        }
         streamFinished(attempt, undefined);
       }
     })();
@@ -724,22 +900,43 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       onLog?: (entry: McpLogMessage) => void;
     },
   ): Promise<OpenStreamHandle> {
-    const transport = await getTransport();
-    return transport.openStream(
-      requestMessage(method, params, nextId("request"), opts?.logLevel),
-      wrapRequestNotifications(onNotification, opts?.onLog),
-      opts,
-    );
+    clearIdleParkTimer();
+    openUserStreams += 1;
+    try {
+      const transport = await getTransport();
+      const handle = await transport.openStream(
+        requestMessage(method, params, nextId("request"), opts?.logLevel),
+        wrapRequestNotifications(onNotification, opts?.onLog),
+        opts,
+      );
+      void handle.done.then(
+        () => {
+          openUserStreams = Math.max(0, openUserStreams - 1);
+          scheduleIdleStdioParkIfEligible();
+        },
+        () => {
+          openUserStreams = Math.max(0, openUserStreams - 1);
+          scheduleIdleStdioParkIfEligible();
+        },
+      );
+      return handle;
+    } catch (err) {
+      openUserStreams = Math.max(0, openUserStreams - 1);
+      scheduleIdleStdioParkIfEligible();
+      throw err;
+    }
   }
 
   async function park(): Promise<void> {
-    if (closed || desiredKey !== "{}" || active || pending) return;
+    clearIdleParkTimer();
+    if (closed || inFlightCount > 0 || openUserStreams > 0 || desiredKey !== "{}" || active || pending) return;
     await closeTransport().catch(() => {});
   }
 
   function close(): Promise<void> {
     if (closePromise) return closePromise;
     closed = true;
+    clearIdleParkTimer();
     clearReconnect();
     const hadAcknowledged = active?.acknowledged === true || pending?.acknowledged === true;
     const attempts = [active, pending].filter(attempt => attempt !== undefined);

@@ -148,7 +148,17 @@ export function createTasksEngine(host: EngineHost, opts: { pollFloorMs?: number
       if (closed || terminal(r)) return;
       const code = (e as {code?:number}).code;
       if (code === -32602) finish(r,final ? 'expired' : 'not_found_or_expired');
-      else if (code === -32021) { blocked.add(k); clear(r); host.log('error', `MCP task capability mismatch: ${String(e)}`); }
+      else if (code === -32021) {
+        blocked.add(k);
+        r.status = 'failed';
+        r.statusMessage = `MCP task capability mismatch (-32021): ${String(e)}`;
+        persist(r);
+        clear(r);
+        cleanupTerminal(r);
+        interest(r.server);
+        wake(r);
+        emitState();
+      }
       else if (final) finish(r,'expired');
       else { failures.set(k,(failures.get(k) ?? 0)+1); host.log('warn', `MCP task polling: ${String(e)}`); }
     } finally { busy.delete(k); schedule(r); }
@@ -164,17 +174,75 @@ export function createTasksEngine(host: EngineHost, opts: { pollFloorMs?: number
     }
     interest(s); for (const r of records.values()) if (r.server === s) schedule(r);
   }
+  function serverRemoved(s: string) {
+    const old = connections.get(s);
+    if (old) {
+      old.off.forEach(fn => fn());
+      connections.delete(s);
+    }
+    for (const r of records.values()) {
+      if (r.server === s) clear(r);
+    }
+    emitState();
+  }
+  function trackCreatedTask(s: string, tool: string, out: import('./types.ts').CreateTaskResult): TaskRecord {
+    validate(out);
+    const r: TaskRecord = {
+      server: s,
+      toolName: tool,
+      taskId: out.taskId,
+      status: out.status,
+      statusMessage: out.statusMessage,
+      createdAt: out.createdAt,
+      lastUpdatedAt: out.lastUpdatedAt,
+      ttlMs: out.ttlMs,
+      pollIntervalMs: out.pollIntervalMs,
+      surfacedInputKeys: [],
+      answeredInputKeys: [],
+    };
+    records.set(key(s, r.taskId), r);
+    persist(r);
+    ready(s);
+    if (out.status === 'input_required') schedule(r, true, true);
+    emitState();
+    return r;
+  }
   const requireRecord = (s: string,id: string) => { const r = records.get(key(s,id)); if (!r) throw new Error(`Unknown MCP task ${s}/${id}`); return r; };
   const checked = async (s:string, method:string, params:JsonObject, opts?: LogOpts) => { const result = await client(s).request(method,params,toReqOpts(opts)); if (result?.resultType === 'task') throw new McpTransportError('protocol','Task result on ineligible method'); return result; };
   const api: TasksEngineApi = {
-    restore(entries) { for (const value of entries) { const e = value as {type?:string;customType?:string;data?:TaskRecord}; if (e?.type === 'custom' && e.customType === CUSTOM_TASKS && e.data) { const r = e.data; try { validate({...r,status: terminal(r) ? 'completed' : r.status}); const rec = structuredClone(r); records.set(key(r.server,r.taskId),rec); if (terminal(rec)) cleanupTerminal(rec); } catch { host.log('warn','Invalid persisted MCP task'); } } } emitState(); },
+    restore(entries) { records.clear(); for (const value of entries) { const e = value as {type?:string;customType?:string;data?:TaskRecord}; if (e?.type === 'custom' && e.customType === CUSTOM_TASKS && e.data) { const r = e.data; try { validate({...r,status: terminal(r) ? 'completed' : r.status}); const rec = structuredClone(r); records.set(key(r.server,r.taskId),rec); if (terminal(rec)) cleanupTerminal(rec); } catch { host.log('warn','Invalid persisted MCP task'); } } } emitState(); },
     serverReady:ready,
-    async call(s,tool,args,signal,opts) { const out = await client(s).request<ToolCallOutcome>('tools/call',{name:tool,arguments:args},{signal,...toReqOpts(opts)}); if (out.resultType === 'task') { validate(out); const r:TaskRecord = {server:s,toolName:tool,taskId:out.taskId,status:out.status,statusMessage:out.statusMessage,createdAt:out.createdAt,lastUpdatedAt:out.lastUpdatedAt,ttlMs:out.ttlMs,pollIntervalMs:out.pollIntervalMs,surfacedInputKeys:[],answeredInputKeys:[]}; records.set(key(s,r.taskId),r); persist(r); ready(s); if (out.status === 'input_required') schedule(r, true, true); emitState(); } else if (out.resultType !== undefined && out.resultType !== 'complete' && out.resultType !== 'input_required') throw new McpTransportError('protocol','Unknown tools/call resultType'); return out; },
+    serverRemoved,
+    trackCreatedTask,
+    async call(s,tool,args,signal,opts) { const out = await client(s).request<ToolCallOutcome>('tools/call',{name:tool,arguments:args},{signal,...toReqOpts(opts)}); if (out.resultType === 'task') { trackCreatedTask(s, tool, out); } else if (out.resultType !== undefined && out.resultType !== 'complete' && out.resultType !== 'input_required') throw new McpTransportError('protocol','Unknown tools/call resultType'); return out; },
     async get(s,id,opts) { const r = requireRecord(s,id); try { return await fetchTask(r,opts); } catch(e) { if ((e as {code?:number}).code === -32602) finish(r,'not_found_or_expired'); throw e; } },
     async update(s,id,inputResponses,opts) { const r = requireRecord(s,id); await checked(s,'tasks/update',{taskId:id,inputResponses},opts); r.answeredInputKeys = [...new Set([...r.answeredInputKeys,...Object.keys(inputResponses)])]; persist(r); },
-    async cancel(s,id,opts) { const r = requireRecord(s,id); const request = checked(s,'tasks/cancel',{taskId:id},opts); r.locallyCancelled = true; r.status = 'cancelled'; r.surfacedInputKeys = []; r.answeredInputKeys = []; clear(r); cleanupTerminal(r); persist(r); interest(s); emitState(); await request; },
+    async cancel(s,id,opts) {
+      const r = requireRecord(s,id);
+      const wasTerminal = terminal(r);
+      const prevLocallyCancelled = r.locallyCancelled;
+      r.locallyCancelled = true;
+      clear(r);
+      try {
+        await checked(s,'tasks/cancel',{taskId:id},opts);
+      } catch (err) {
+        if (!wasTerminal && !terminal(r)) {
+          r.locallyCancelled = prevLocallyCancelled;
+          schedule(r);
+        }
+        throw err;
+      }
+      r.status = 'cancelled';
+      r.surfacedInputKeys = [];
+      r.answeredInputKeys = [];
+      clear(r);
+      cleanupTerminal(r);
+      persist(r);
+      interest(s);
+      emitState();
+    },
     active:() => [...records.values()].map(r => structuredClone(r)),
-    hasPending:() => [...records.values()].some(r => !terminal(r)),
+    hasPending:() => [...records.values()].some(r => !terminal(r) && Boolean(host.getClient(r.server))),
     onWake(fn) { listeners.add(fn); return () => { listeners.delete(fn); }; },
     onStateChange(fn) { stateListeners.add(fn); return () => { stateListeners.delete(fn); }; },
     async shutdown() { closed = true; for (const t of timers.values()) clearTimeout(t); timers.clear(); for (const c of connections.values()) { c.off.forEach(fn => fn()); c.client.setListenInterest('tasks',{}); } connections.clear(); emitState(); host.signal.removeEventListener('abort',abort); },

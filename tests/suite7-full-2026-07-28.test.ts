@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, createVerify, generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -10,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildMeta, createServerClient, extractTraceMeta } from "../src/client.ts";
 import { createAuthResolver } from "../src/config.ts";
 import { inspectElicitationUrl, runElicitationPrompt, type ElicitationUi } from "../src/elicitation.ts";
+import { parseClientCredentialsConfig } from "../src/oauth-client-credentials.ts";
 import {
   EXT_OAUTH_CLIENT_CREDENTIALS,
   EXT_SKILLS,
@@ -1004,7 +1006,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     }
 
     const discovered = await runner.emitResourcesDiscover(projectDir, "reload");
-    assert.equal(discovered.skillPaths.length, 1);
+    assert.equal(
+      discovered.skillPaths.length,
+      0,
+      "cached MCP skills MUST be excluded from filesystem skill discovery to preserve MCP origin",
+    );
 
     const supportFile = JSON.parse(
       (
@@ -1199,5 +1205,233 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("9. Adversarial review regressions: synchronous MRTR input_required (requestState + new request id), fail-closed headless skills, dynamic read_file confinement, OAuth mandatory issuer + SSRF block, and x-mcp-header validation", async () => {
+  // A. URL control-char / cmd-injection guard
+  assert.equal(inspectElicitationUrl("https://example.com/ok?x=1\n2").valid, false);
+  assert.equal(inspectElicitationUrl("https://example.com/ok?x=1 2").valid, false);
+
+  // B. OAuth clientCredentials requires pinned issuer and blocks remote -> loopback SSRF
+  const missingIssuer = parseClientCredentialsConfig(
+    { clientCredentials: { clientId: "id", clientSecret: "sec" } },
+    "https://mcp.example.com/mcp",
+    "global",
+  );
+  assert.equal(missingIssuer.config, undefined);
+  assert.match(missingIssuer.warning ?? "", /pinned issuer/i);
+
+  const loopbackSsrf = parseClientCredentialsConfig(
+    { clientCredentials: { clientId: "id", clientSecret: "sec", issuer: "http://127.0.0.1:9999" } },
+    "https://mcp.example.com/mcp",
+    "global",
+  );
+  assert.equal(loopbackSsrf.config, undefined);
+
+  // C. Full YAML 1.2 frontmatter parsing (multiline block scalars + nested metadata)
+  const { parseSkillFrontmatter, createSkillsEngine } = await import("../src/skills.ts");
+  const parsedYaml = parseSkillFrontmatter(
+    "---\nname: deep-skill\ndescription: |\n  First line\n  Second line\nmetadata:\n  author: sec-team\n---\n# Body\n",
+  );
+  assert.equal(parsedYaml?.name, "deep-skill");
+  assert.match(String(parsedYaml?.description), /First line\nSecond line/);
+  assert.deepEqual(parsedYaml?.metadata, { author: "sec-team" });
+
+  // D. Strict x-mcp-header validation rejects disallowed keywords ($ref, oneOf, items, float number)
+  const { validateXMcpHeaders } = await import("../src/transport-http.ts");
+  assert.equal(
+    validateXMcpHeaders({
+      type: "object",
+      properties: { ok: { type: "string", "x-mcp-header": "Region" } },
+    }).valid,
+    true,
+  );
+  assert.equal(
+    validateXMcpHeaders({
+      type: "object",
+      oneOf: [{ properties: { bad: { type: "string", "x-mcp-header": "Region" } } }],
+    }).valid,
+    false,
+  );
+  assert.equal(
+    validateXMcpHeaders({
+      type: "object",
+      properties: { badNum: { type: "number", "x-mcp-header": "Score" } },
+    }).valid,
+    false,
+  );
+
+  // E. Synchronous MRTR input_required loop on prompts/get + fail-closed headless skills + dynamic read_file confinement
+  const seenIds: Array<string | number> = [];
+  let mrtrRound = 0;
+  const httpSrv = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    seenIds.push(body.id);
+
+    if (body.method === "server/discover") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            resultType: "complete",
+            supportedVersions: ["2026-07-28"],
+            capabilities: {
+              prompts: {},
+              resources: {},
+              extensions: { "io.modelcontextprotocol/skills": {} },
+            },
+          },
+        }),
+      );
+      return;
+    }
+
+    if (body.method === "prompts/get") {
+      mrtrRound += 1;
+      if (mrtrRound === 1) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              resultType: "input_required",
+              requestState: { opaqueToken: "st-99" },
+              inputRequests: {
+                "ask-1": {
+                  method: "elicitation/create",
+                  params: {
+                    message: "Confirm target branch",
+                    requestedSchema: {
+                      type: "object",
+                      properties: { branch: { type: "string" } },
+                      required: ["branch"],
+                    },
+                  },
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      assert.deepEqual(body.params.requestState, { opaqueToken: "st-99" });
+      assert.deepEqual(body.params.inputResponses, {
+        "ask-1": { action: "accept", content: { branch: "main" } },
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            resultType: "complete",
+            messages: [
+              { role: "user", content: { type: "text", text: `Deploying ${body.params.inputResponses["ask-1"].content.branch}` } },
+            ],
+          },
+        }),
+      );
+      return;
+    }
+
+    if (body.method === "skills/get") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            resultType: "complete",
+            skill: {
+              uri: "skill://dyn-skill/SKILL.md",
+              frontmatter: { name: "dyn-skill", description: "Dynamic test skill" },
+              resources: "dynamic",
+            },
+          },
+        }),
+      );
+      return;
+    }
+
+    if (body.method === "resources/read") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            resultType: "complete",
+            contents: [
+              {
+                uri: body.params.uri,
+                text: "---\nname: dyn-skill\ndescription: Dynamic test skill\n---\n# Dyn\n",
+              },
+            ],
+          },
+        }),
+      );
+      return;
+    }
+
+    res.writeHead(404).end();
+  });
+
+  await new Promise<void>((resolveListen) => httpSrv.listen(0, "127.0.0.1", () => resolveListen()));
+  const port = (httpSrv.address() as AddressInfo).port;
+  const cfg: ResolvedHttpServer = {
+    name: "mrtr-srv",
+    namespace: "mcp__mrtr_srv",
+    scope: "global",
+    enabled: true,
+    timeoutMs: 5_000,
+    transport: "http",
+    url: `http://127.0.0.1:${port}/mcp`,
+    headers: {},
+  };
+
+  const mrtrClient = createServerClient(cfg, {
+    cwd: process.cwd(),
+    meta: () => buildMeta({ elicitation: true, skills: true }),
+    fulfillInputRequests: async (_srv, reqs) => {
+      assert.ok("ask-1" in reqs);
+      return { "ask-1": { action: "accept", content: { branch: "main" } } };
+    },
+  });
+
+  try {
+    await mrtrClient.discover();
+    const promptRes = await mrtrClient.request<JsonObject>("prompts/get", { name: "deploy" });
+    assert.equal((promptRes.messages as any[])[0].content.text, "Deploying main");
+    assert.notEqual(seenIds[1], seenIds[2], "MRTR continuation MUST use a fresh JSON-RPC request ID");
+
+    // Fail-closed headless skill load (no approve callback) + dynamic read_file URI confinement
+    const skills = createSkillsEngine({
+      getClient: (s) => (s === "mrtr-srv" ? mrtrClient : undefined),
+      appendEntry: () => {},
+      wake: () => {},
+      log: () => {},
+      signal: new AbortController().signal,
+    });
+    await assert.rejects(
+      () => skills.load("mrtr-srv", "skill://dyn-skill/SKILL.md"),
+      /interactive user approval is required/,
+    );
+    await skills.load("mrtr-srv", "skill://dyn-skill/SKILL.md", {
+      approve: async () => true,
+    });
+    await assert.rejects(
+      () => skills.readFile("mrtr-srv", "skill://dyn-skill/SKILL.md", "file:///etc/passwd"),
+      /outside skill root/,
+    );
+    await skills.shutdown();
+  } finally {
+    await mrtrClient.close();
+    await new Promise<void>((r) => httpSrv.close(() => r()));
   }
 });

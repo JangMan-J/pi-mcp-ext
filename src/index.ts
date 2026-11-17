@@ -37,6 +37,7 @@ import {
 import { createResourcesEngine, type ResourcesEngineApi } from "./resources.ts";
 import { createSkillsEngine, type SkillsEngineApi } from "./skills.ts";
 import { createTasksEngine } from "./tasks.ts";
+import { cleanupPrivateTempDir } from "./temp-files.ts";
 import { createToolsFallback, type ToolsFallbackApi } from "./tools-fallback.ts";
 import {
   EXT_TASKS,
@@ -44,6 +45,7 @@ import {
   MESSAGE_RESOURCE,
   MESSAGE_TASK,
   McpTransportError,
+  PROTOCOL_VERSION,
   type AuthResolver,
   type ConfigLoadOptions,
   type ConfigWarning,
@@ -760,16 +762,9 @@ function startServerProbe(
       if (state.tools) {
         tookToolsFallback = await session.toolsFallback.activateIfUnowned(server);
       }
-      // Park idle stdio transport on dual-stack servers where builtin:mcp already owns tools and no
-      // 2026-07-28-specific engine needs a standing process; lazy reconnect reopens on demand.
-      if (
-        !tookToolsFallback &&
-        !state.events &&
-        !state.tasks &&
-        !state.prompts &&
-        !state.skills &&
-        session.resources.subscriptions(server.name).length === 0
-      ) {
+      // Park idle stdio transport whenever no standing stream/listen interest is active;
+      // client.park() checks desiredKey === "{}", inFlightCount === 0, and openUserStreams === 0.
+      if (!tookToolsFallback) {
         await client.park?.();
       }
       updateFooter(session);
@@ -789,6 +784,10 @@ function startServerProbe(
 
 async function detachClient(session: SessionRuntime, name: string): Promise<void> {
   session.toolsFallback.deactivateServer(name);
+  session.events.serverRemoved?.(name);
+  session.tasks.serverRemoved?.(name);
+  session.resources.serverRemoved?.(name);
+  session.prompts.serverRemoved?.(name);
   session.clientCleanups.get(name)?.();
   session.clientCleanups.delete(name);
   session.probePromises.delete(name);
@@ -890,6 +889,20 @@ async function reconcileConfiguredServers(
           oauthClientCredentials: server.transport === "http" && Boolean(server.clientCredentials),
           traceContext: process.env,
         }),
+      autoParkIdleStdio: () => Boolean(client.state.supportedVersions?.some((v) => v < PROTOCOL_VERSION)),
+      fulfillInputRequests: async (srvName, inputRequests) => {
+        if (!session.host.fulfillElicitation || !session.latestCtx?.hasUI) return undefined;
+        const responses: JsonObject = {};
+        for (const [reqKey, reqItem] of Object.entries(inputRequests)) {
+          if (reqItem.method !== "elicitation/create") {
+            return undefined;
+          }
+          const out = await session.host.fulfillElicitation(srvName, reqItem.params ?? {});
+          if (!out) return undefined;
+          responses[reqKey] = out as unknown as JsonObject;
+        }
+        return responses;
+      },
       log: (level: "info" | "warn" | "error", msg: string) => {
         session.host.log(level, msg);
       },
@@ -1006,7 +1019,7 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
   const resources: ResourcesEngineApi = createResourcesEngine(host);
   const prompts: PromptsEngineApi = createPromptsEngine(host);
   const skills: SkillsEngineApi = createSkillsEngine(host);
-  const toolsFallback: ToolsFallbackApi = createToolsFallback(pi, host);
+  const toolsFallback: ToolsFallbackApi = createToolsFallback(pi, host, { tasks });
 
   const session: SessionRuntime = {
     controller,
@@ -1075,6 +1088,9 @@ function shutdownSession(
   }
 
   session.shutdownPromise = (async (): Promise<void> => {
+    // Flush coalesced event/resource batches while wake() is still live so cursors commit after delivery.
+    session.events.flushPending?.();
+    session.resources.flushPending?.();
     session.controller.abort();
     const uiCtx = ctx ?? session.latestCtx;
     if (uiCtx?.hasUI) {
@@ -1114,6 +1130,7 @@ function shutdownSession(
     session.clients.clear();
     session.probePromises.clear();
     session.activationPromises.clear();
+    cleanupPrivateTempDir();
 
     if (uiCtx?.hasUI) {
       uiCtx.ui.setStatus(STATUS_KEY, undefined);
@@ -2162,9 +2179,17 @@ export default function extension(pi: ExtensionAPI): void {
                   }
                 : undefined,
             });
+            const escAttr = (s: string) =>
+              s
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+            const escBody = loaded.content.replace(/<\/(mcp_[a-zA-Z0-9_]*)/gi, "<\\/$1");
             const framed =
-              `<mcp_skill server="${loaded.server}" uri="${loaded.uri}" name="${loaded.name}">\n` +
-              `${loaded.content}\n` +
+              `<mcp_skill server="${escAttr(loaded.server)}" uri="${escAttr(loaded.uri)}" name="${escAttr(loaded.name)}">\n` +
+              `${escBody}\n` +
               `</mcp_skill>`;
             const content: TextContent[] = [
               {
@@ -2247,7 +2272,7 @@ export default function extension(pi: ExtensionAPI): void {
     const branchEntries = ctx.sessionManager.getBranch();
     const allEntries = ctx.sessionManager.getEntries();
     session.events.restore(branchEntries, allEntries);
-    session.tasks.restore(allEntries);
+    session.tasks.restore(branchEntries);
     session.resources.restore(branchEntries);
     session.skills.restore(allEntries);
     updateFooter(session, ctx);
@@ -2278,6 +2303,7 @@ export default function extension(pi: ExtensionAPI): void {
     session.latestCtx = ctx;
     const branch = ctx.sessionManager.getBranch();
     session.events.restore(branch, ctx.sessionManager.getEntries());
+    session.tasks.restore(branch);
     session.resources.restore(branch);
     updateFooter(session, ctx);
   });
