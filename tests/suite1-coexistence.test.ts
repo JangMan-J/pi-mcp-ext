@@ -178,11 +178,17 @@ test("Suite 1: factory load opens no handles or child processes and coexists wit
     assert.ok(ourExt, "package.json pi.extensions entry must load");
 
     assert.equal(ourExt.commands.has("mcp"), false, "pi-mcp-ext must not register /mcp");
-    assert.equal(ourExt.commands.size, 0, "pi-mcp-ext must not register slash commands");
+    assert.deepEqual([...ourExt.commands.keys()].sort(), ["mcp-prompt"]);
     assert.equal(ourExt.flags.size, 0, "pi-mcp-ext must not register CLI flags");
 
     const ourTools = [...ourExt.tools.keys()].sort();
-    assert.deepEqual(ourTools, ["mcp_events", "mcp_tasks"]);
+    assert.deepEqual(ourTools, [
+      "mcp_events",
+      "mcp_prompts",
+      "mcp_resources",
+      "mcp_skills",
+      "mcp_tasks",
+    ]);
     for (const toolName of ourTools) {
       assert.equal(FORBIDDEN_TOOL_NAMES.has(toolName), false);
       assert.equal(toolName.startsWith("mcp__"), false);
@@ -190,7 +196,7 @@ test("Suite 1: factory load opens no handles or child processes and coexists wit
 
     assert.deepEqual(
       [...ourExt.messageRenderers.keys()].sort(),
-      ["mcp-event", "mcp-task"],
+      ["mcp-event", "mcp-resource", "mcp-task"],
     );
   } finally {
     if (prevAgentDir === undefined) {

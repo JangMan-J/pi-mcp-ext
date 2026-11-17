@@ -5,12 +5,13 @@
  * Registers mcp_events, mcp_tasks, message renderers, and session lifecycle handlers.
  */
 
-import { StringEnum, type TextContent } from "@earendil-works/pi-ai";
+import { StringEnum, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import type {
   AgentBeforeSettleEvent,
   AgentBeforeSettleEventResult,
   AgentToolResult,
   ExtensionAPI,
+  ExtensionCommandContext,
   ExtensionContext,
   ExtensionToolContext,
   MessageRenderOptions,
@@ -20,15 +21,27 @@ import type {
   ToolResultEvent,
   ToolResultEventResult,
 } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type, type Static, type TUnsafe } from "typebox";
 
-import { createServerClient } from "./client.ts";
+import { buildMeta, createServerClient } from "./client.ts";
 import { createAuthResolver, loadServerConfigs } from "./config.ts";
+import { runElicitationPrompt } from "./elicitation.ts";
 import { createEventsEngine } from "./events.ts";
+import {
+  createPromptsEngine,
+  parseSlashPromptInput,
+  type PromptDescriptor,
+  type PromptsEngineApi,
+} from "./prompts.ts";
+import { createResourcesEngine, type ResourcesEngineApi } from "./resources.ts";
+import { createSkillsEngine, type SkillsEngineApi } from "./skills.ts";
 import { createTasksEngine } from "./tasks.ts";
+import { createToolsFallback, type ToolsFallbackApi } from "./tools-fallback.ts";
 import {
   EXT_TASKS,
   MESSAGE_EVENT,
+  MESSAGE_RESOURCE,
   MESSAGE_TASK,
   McpTransportError,
   type AuthResolver,
@@ -71,6 +84,10 @@ interface SessionRuntime {
   readonly host: EngineHost;
   readonly events: EventsEngineApi;
   readonly tasks: TasksEngineApi;
+  readonly resources: ResourcesEngineApi;
+  readonly prompts: PromptsEngineApi;
+  readonly skills: SkillsEngineApi;
+  readonly toolsFallback: ToolsFallbackApi;
   readonly configuredServers: Map<string, ConfiguredServerEntry>;
   readonly clients: Map<string, ServerClient>;
   readonly clientCleanups: Map<string, () => void>;
@@ -205,6 +222,133 @@ const McpTasksParams = Type.Object(
 
 type McpTasksInput = Static<typeof McpTasksParams>;
 
+const LOG_LEVEL_SCHEMA = Type.Optional(
+  stringEnum(
+    ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"],
+    {
+      description:
+        "Per-request MCP log level (SEP-2575 io.modelcontextprotocol/logLevel).",
+    },
+  ),
+);
+
+const McpResourcesParams = Type.Object(
+  {
+    action: stringEnum(
+      ["list", "templates", "read", "directory", "subscribe", "unsubscribe", "subscriptions"],
+      { description: "Resource or resource-subscription operation to perform." },
+    ),
+    server: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Target MCP server name (required except for 'subscriptions').",
+      }),
+    ),
+    uri: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Resource or directory URI (required for read, directory, subscribe, unsubscribe).",
+      }),
+    ),
+    cursor: Type.Optional(
+      Type.String({
+        description: "Pagination cursor for list, templates, or directory.",
+      }),
+    ),
+    holdSettle: Type.Optional(
+      Type.Boolean({
+        description: "Hold headless print/json runs open while this resource watch is active.",
+      }),
+    ),
+    logLevel: LOG_LEVEL_SCHEMA,
+  },
+  { additionalProperties: false },
+);
+
+type McpResourcesInput = Static<typeof McpResourcesParams>;
+
+const McpPromptsParams = Type.Object(
+  {
+    action: stringEnum(["list", "get", "complete"], {
+      description: "Prompt discovery, retrieval, or argument completion.",
+    }),
+    server: Type.String({
+      minLength: 1,
+      description: "Target MCP server name.",
+    }),
+    name: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Prompt name (required for get, or complete with refType='prompt').",
+      }),
+    ),
+    uri: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Resource URI or template (for complete with refType='resource').",
+      }),
+    ),
+    refType: Type.Optional(
+      stringEnum(["prompt", "resource"], {
+        description: "Completion reference type (default: 'prompt', or 'resource' when uri is given).",
+      }),
+    ),
+    arguments: Type.Optional(
+      Type.Record(Type.String(), Type.String(), {
+        description: "Prompt arguments for 'get', or already-resolved context.arguments for 'complete'.",
+      }),
+    ),
+    argumentName: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Argument name being completed (required for 'complete').",
+      }),
+    ),
+    argumentValue: Type.Optional(
+      Type.String({
+        description: "Current partial argument value (for 'complete', default '').",
+      }),
+    ),
+    logLevel: LOG_LEVEL_SCHEMA,
+  },
+  { additionalProperties: false },
+);
+
+type McpPromptsInput = Static<typeof McpPromptsParams>;
+
+const McpSkillsParams = Type.Object(
+  {
+    action: stringEnum(["list", "get", "load", "read_file", "directory"], {
+      description: "Skills over MCP (io.modelcontextprotocol/skills) operation.",
+    }),
+    server: Type.String({
+      minLength: 1,
+      description: "Target MCP server name.",
+    }),
+    uri: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Skill SKILL.md URI (required for get, load, read_file) or directory URI (for directory).",
+      }),
+    ),
+    path: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Relative path or URI inside the retained skill manifest (required for read_file).",
+      }),
+    ),
+    cursor: Type.Optional(
+      Type.String({
+        description: "Pagination cursor for action 'directory'.",
+      }),
+    ),
+    logLevel: LOG_LEVEL_SCHEMA,
+  },
+  { additionalProperties: false },
+);
+
+type McpSkillsInput = Static<typeof McpSkillsParams>;
+
 function isPlainObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -276,7 +420,7 @@ function updateFooter(session: SessionRuntime | undefined, ctxOverride?: Extensi
   const taskCount = session.tasks
     .active()
     .filter((t) => t.status === "working" || t.status === "input_required").length;
-  const streamCount = session.events.activeStreams();
+  const streamCount = session.events.activeStreams() + session.resources.activeWatches();
   ctx.ui.setStatus(STATUS_KEY, formatFooterStatus(taskCount, streamCount));
 }
 
@@ -332,7 +476,7 @@ function raceWithSignals<T>(promise: Promise<T>, signals: readonly (AbortSignal 
 async function ensureModernCapability(
   session: SessionRuntime,
   serverName: string,
-  capability: "events" | "tasks",
+  capability: "events" | "tasks" | "resources" | "prompts" | "completions" | "skills",
   signal: AbortSignal | undefined,
 ): Promise<ServerClient> {
   await raceWithSignals(session.configLoadChain, [signal, session.controller.signal]);
@@ -376,13 +520,27 @@ async function ensureModernCapability(
           `MCP server "${serverName}" does not advertise io.modelcontextprotocol/tasks.`,
         );
       }
+      if (capability === "resources" && !state.resources) {
+        throw new Error(`MCP server "${serverName}" does not advertise resources.`);
+      }
+      if (capability === "prompts" && !state.prompts) {
+        throw new Error(`MCP server "${serverName}" does not advertise prompts.`);
+      }
+      if (capability === "completions" && !state.completions && !state.prompts && !state.resources) {
+        throw new Error(`MCP server "${serverName}" does not advertise completions.`);
+      }
+      if (capability === "skills" && !state.skills) {
+        throw new Error(
+          `MCP server "${serverName}" does not advertise both resources and io.modelcontextprotocol/skills.`,
+        );
+      }
       return client;
     }
     case "needs-auth":
       throw new Error(`MCP server "${serverName}" requires sign-in; run /mcp login ${serverName}`);
     case "modern-dormant":
       throw new Error(
-        `MCP server "${serverName}" does not advertise io.modelcontextprotocol/${capability}.`,
+        `MCP server "${serverName}" does not advertise ${capability}.`,
       );
     case "unsupported-modern-version": {
       const supported = state.supportedVersions?.length
@@ -394,7 +552,7 @@ async function ensureModernCapability(
     }
     case "legacy":
       throw new Error(
-        `MCP server "${serverName}" speaks legacy MCP (pre-2026-07-28); use its standard MCP tools instead of ${capability === "events" ? "mcp_events" : "mcp_tasks"}.`,
+        `MCP server "${serverName}" speaks legacy MCP (pre-2026-07-28); use its standard MCP tools instead.`,
       );
     case "disabled":
       throw new Error(`MCP server "${serverName}" is disabled.`);
@@ -515,11 +673,17 @@ async function activateDeclaredSubscriptions(
 }
 
 function serverTransportKey(server: ConfiguredServerEntry): string {
+  const base = {
+    enabled: server.enabled,
+    timeoutMs: server.timeoutMs,
+    exposure: server.exposure ?? null,
+    toolExposure: server.toolExposure ?? null,
+    description: server.description ?? null,
+  };
   if (server.transport === "stdio") {
     return JSON.stringify({
+      ...base,
       transport: "stdio",
-      enabled: server.enabled,
-      timeoutMs: server.timeoutMs,
       command: server.command,
       args: server.args,
       env: Object.entries(server.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
@@ -527,12 +691,12 @@ function serverTransportKey(server: ConfiguredServerEntry): string {
     });
   }
   return JSON.stringify({
+    ...base,
     transport: "http",
-    enabled: server.enabled,
-    timeoutMs: server.timeoutMs,
     url: server.url,
     headers: Object.entries(server.headers).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
     authProvider: server.authProvider ?? null,
+    clientCredentials: server.clientCredentials ?? null,
   });
 }
 
@@ -579,6 +743,35 @@ function startServerProbe(
       if (state.tasks) {
         session.tasks.serverReady(server.name);
       }
+      if (state.resources) {
+        session.resources.serverReady(server.name);
+      }
+      if (state.prompts) {
+        await session.prompts.serverReady(server.name).catch((err) => {
+          if (!signal.aborted) {
+            session.host.log(
+              "warn",
+              `MCP server "${server.name}" prompts discovery failed: ${errorMessage(err)}`,
+            );
+          }
+        });
+      }
+      let tookToolsFallback = false;
+      if (state.tools) {
+        tookToolsFallback = await session.toolsFallback.activateIfUnowned(server);
+      }
+      // Park idle stdio transport on dual-stack servers where builtin:mcp already owns tools and no
+      // 2026-07-28-specific engine needs a standing process; lazy reconnect reopens on demand.
+      if (
+        !tookToolsFallback &&
+        !state.events &&
+        !state.tasks &&
+        !state.prompts &&
+        !state.skills &&
+        session.resources.subscriptions(server.name).length === 0
+      ) {
+        await client.park?.();
+      }
       updateFooter(session);
     } catch (err) {
       if (!signal.aborted) {
@@ -595,6 +788,7 @@ function startServerProbe(
 }
 
 async function detachClient(session: SessionRuntime, name: string): Promise<void> {
+  session.toolsFallback.deactivateServer(name);
   session.clientCleanups.get(name)?.();
   session.clientCleanups.delete(name);
   session.probePromises.delete(name);
@@ -689,6 +883,13 @@ async function reconcileConfiguredServers(
     const client: ServerClient = createServerClient(server, {
       cwd: session.cwd,
       ...(auth ? { auth } : {}),
+      meta: () =>
+        buildMeta({
+          skills: true,
+          elicitation: Boolean(session.latestCtx?.hasUI),
+          oauthClientCredentials: server.transport === "http" && Boolean(server.clientCredentials),
+          traceContext: process.env,
+        }),
       log: (level: "info" | "warn" | "error", msg: string) => {
         session.host.log(level, msg);
       },
@@ -755,7 +956,7 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
       }
     },
     wake(
-      customType: typeof MESSAGE_EVENT | typeof MESSAGE_TASK,
+      customType: typeof MESSAGE_EVENT | typeof MESSAGE_TASK | typeof MESSAGE_RESOURCE,
       content: string,
       details: unknown,
     ): void {
@@ -789,6 +990,12 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
         activeCtx.ui.notify(message, level === "warn" ? "warning" : "error");
       }
     },
+    async fulfillElicitation(server: string, params: JsonObject) {
+      if (controller.signal.aborted) return undefined;
+      const activeCtx = runtimeRef?.latestCtx;
+      if (!activeCtx?.hasUI) return undefined;
+      return runElicitationPrompt(activeCtx.ui, server, params);
+    },
     get signal(): AbortSignal {
       return controller.signal;
     },
@@ -796,6 +1003,10 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
 
   const events: EventsEngineApi = createEventsEngine(host);
   const tasks: TasksEngineApi = createTasksEngine(host);
+  const resources: ResourcesEngineApi = createResourcesEngine(host);
+  const prompts: PromptsEngineApi = createPromptsEngine(host);
+  const skills: SkillsEngineApi = createSkillsEngine(host);
+  const toolsFallback: ToolsFallbackApi = createToolsFallback(pi, host);
 
   const session: SessionRuntime = {
     controller,
@@ -804,6 +1015,10 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
     host,
     events,
     tasks,
+    resources,
+    prompts,
+    skills,
+    toolsFallback,
     configuredServers,
     clients,
     clientCleanups,
@@ -819,39 +1034,24 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
   };
   runtimeRef = session;
 
-  cleanups.push(
-    events.onWake(() => {
-      updateFooter(session);
-      for (const listener of [...wakeListeners]) {
-        listener();
-      }
-      notifySettleListeners(session);
-    }),
-  );
-  cleanups.push(
-    tasks.onWake(() => {
-      updateFooter(session);
-      for (const listener of [...wakeListeners]) {
-        listener();
-      }
-      notifySettleListeners(session);
-    }),
-  );
-  if (events.onStateChange) {
+  for (const engine of [events, tasks, resources]) {
     cleanups.push(
-      events.onStateChange(() => {
+      engine.onWake(() => {
         updateFooter(session);
+        for (const listener of [...wakeListeners]) {
+          listener();
+        }
         notifySettleListeners(session);
       }),
     );
-  }
-  if (tasks.onStateChange) {
-    cleanups.push(
-      tasks.onStateChange(() => {
-        updateFooter(session);
-        notifySettleListeners(session);
-      }),
-    );
+    if (engine.onStateChange) {
+      cleanups.push(
+        engine.onStateChange(() => {
+          updateFooter(session);
+          notifySettleListeners(session);
+        }),
+      );
+    }
   }
 
   return session;
@@ -900,7 +1100,14 @@ function shutdownSession(
     session.wakeListeners.clear();
     session.settleListeners.clear();
 
-    await Promise.allSettled([session.events.shutdown(), session.tasks.shutdown()]);
+    await Promise.allSettled([
+      session.events.shutdown(),
+      session.tasks.shutdown(),
+      session.resources.shutdown(),
+      session.prompts.shutdown(),
+      session.skills.shutdown(),
+      session.toolsFallback.shutdown(),
+    ]);
     await Promise.allSettled(
       [...session.clients.values()].map((client: ServerClient) => client.close()),
     );
@@ -1035,6 +1242,23 @@ function summarizeTaskDetails(message: RenderedCustomMessage): string {
   return singleLineFallback(message.content).replace(/\s+/g, " ");
 }
 
+function summarizeResourceDetails(message: RenderedCustomMessage): string {
+  const details = message.details;
+  if (isPlainObject(details) && Array.isArray(details.resources)) {
+    const parts: string[] = [];
+    for (const item of details.resources) {
+      if (!isPlainObject(item) || typeof item.server !== "string") continue;
+      const uris = Array.isArray(item.updatedUris)
+        ? item.updatedUris.filter((u): u is string => typeof u === "string")
+        : [];
+      if (uris.length > 0) parts.push(`${item.server}: ${uris.join(", ")}`);
+      else if (item.listChanged === true) parts.push(`${item.server}: list changed`);
+    }
+    if (parts.length > 0) return parts.join(" · ");
+  }
+  return singleLineFallback(message.content).replace(/\s+/g, " ");
+}
+
 function clampPlainText(text: string, maxCols: number): string {
   if (maxCols <= 0) return "";
   if (text.length <= maxCols) return text;
@@ -1159,6 +1383,7 @@ function createExpandableJsonRenderer(
 
 export default function extension(pi: ExtensionAPI): void {
   let currentSession: SessionRuntime | undefined;
+  const registeredPromptCommandNames = new Set<string>();
 
   function requireActiveSession(): SessionRuntime {
     if (!currentSession || currentSession.controller.signal.aborted) {
@@ -1167,6 +1392,185 @@ export default function extension(pi: ExtensionAPI): void {
     return currentSession;
   }
 
+  async function executeSlashPrompt(
+    serverName: string,
+    promptName: string,
+    rawArgs: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    const session = requireActiveSession();
+    session.latestCtx = ctx;
+    await ensureModernCapability(session, serverName, "prompts", undefined);
+    const descriptors = await session.prompts.list(serverName);
+    const descriptor = descriptors.find((d) => d.name === promptName);
+    const parsed = parseSlashPromptInput(rawArgs, descriptor?.arguments);
+    const resolvedArgs = { ...parsed.resolved };
+
+    // Prompt interactively for any missing required arguments when UI is available.
+    if (ctx.hasUI && descriptor?.arguments) {
+      for (const argDef of descriptor.arguments) {
+        if (argDef.required && !(argDef.name in resolvedArgs)) {
+          const val = await ctx.ui.input(
+            `[${serverName}/${promptName}] ${argDef.title ?? argDef.name}${argDef.description ? ` — ${argDef.description}` : ""}`,
+            "Required argument",
+          );
+          if (val === undefined) return;
+          resolvedArgs[argDef.name] = val;
+        }
+      }
+    }
+
+    const promptRes = await session.prompts.get(serverName, promptName, resolvedArgs);
+    if (promptRes.images.length > 0) {
+      const blocks: Array<TextContent | ImageContent> = [];
+      if (promptRes.renderedText) blocks.push({ type: "text", text: promptRes.renderedText });
+      blocks.push(...promptRes.images);
+      pi.sendUserMessage(blocks);
+    } else {
+      pi.sendUserMessage(promptRes.renderedText || `Run prompt ${serverName}/${promptName}`);
+    }
+  }
+
+  function ensurePerPromptCommand(serverName: string, prompt: PromptDescriptor): void {
+    const cmdName = `mcp-prompt:${serverName}:${prompt.name}`;
+    if (registeredPromptCommandNames.has(cmdName)) return;
+    registeredPromptCommandNames.add(cmdName);
+    pi.registerCommand(cmdName, {
+      description: prompt.description ?? prompt.title ?? `MCP prompt ${prompt.name} (${serverName})`,
+      getArgumentCompletions: async (prefix: string): Promise<AutocompleteItem[] | null> => {
+        const session = currentSession;
+        if (!session || session.controller.signal.aborted) return null;
+        const latestDesc = session.prompts
+          .cachedPrompts()
+          .find((p) => p.server === serverName && p.prompt.name === prompt.name)?.prompt;
+        if (!latestDesc) return null;
+        const parsed = parseSlashPromptInput(prefix, latestDesc.arguments);
+        if (!parsed.completing) return null;
+        try {
+          const comp = await session.prompts.complete(
+            serverName,
+            { type: "ref/prompt", name: prompt.name },
+            { name: parsed.completing.name, value: parsed.completing.value },
+            parsed.resolved,
+          );
+          if (comp.values.length === 0) return null;
+          return comp.values.map((v) => {
+            const quoted = /\s/.test(v) ? JSON.stringify(v) : v;
+            const fullVal = `${parsed.completing!.replacePrefix}${quoted}`;
+            return { value: fullVal, label: v, description: `${parsed.completing!.name}` };
+          });
+        } catch {
+          return null;
+        }
+      },
+      handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+        try {
+          await executeSlashPrompt(serverName, prompt.name, args, ctx);
+        } catch (err) {
+          if (ctx.hasUI) ctx.ui.notify(errorMessage(err), "error");
+          else throw err;
+        }
+      },
+    });
+  }
+
+  pi.registerCommand("mcp-prompt", {
+    description: "Invoke an MCP 2026-07-28 server prompt (/mcp-prompt <server>/<prompt> [key=value ...])",
+    getArgumentCompletions: async (prefix: string): Promise<AutocompleteItem[] | null> => {
+      const session = currentSession;
+      if (!session || session.controller.signal.aborted) return null;
+      const all = session.prompts.cachedPrompts();
+      if (all.length === 0) return null;
+
+      const firstSpace = prefix.indexOf(" ");
+      if (firstSpace === -1) {
+        const matches = all
+          .map(({ server, prompt }) => ({
+            target: `${server}/${prompt.name}`,
+            desc: prompt.description ?? prompt.title,
+          }))
+          .filter((item) => item.target.startsWith(prefix));
+        return matches.length > 0
+          ? matches.map((m) => ({
+              value: `${m.target} `,
+              label: m.target,
+              ...(m.desc ? { description: m.desc } : {}),
+            }))
+          : null;
+      }
+
+      const head = prefix.slice(0, firstSpace);
+      const slash = head.indexOf("/");
+      if (slash <= 0) return null;
+      const serverName = head.slice(0, slash);
+      const promptName = head.slice(slash + 1);
+      const found = all.find((p) => p.server === serverName && p.prompt.name === promptName);
+      if (!found) return null;
+
+      const tail = prefix.slice(firstSpace + 1);
+      const parsed = parseSlashPromptInput(tail, found.prompt.arguments);
+      if (!parsed.completing) return null;
+      try {
+        const comp = await session.prompts.complete(
+          serverName,
+          { type: "ref/prompt", name: promptName },
+          { name: parsed.completing.name, value: parsed.completing.value },
+          parsed.resolved,
+        );
+        if (comp.values.length === 0) return null;
+        return comp.values.map((v) => {
+          const quoted = /\s/.test(v) ? JSON.stringify(v) : v;
+          return {
+            value: `${head} ${parsed.completing!.replacePrefix}${quoted}`,
+            label: v,
+            description: parsed.completing!.name,
+          };
+        });
+      } catch {
+        return null;
+      }
+    },
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      const session = requireActiveSession();
+      session.latestCtx = ctx;
+      await raceWithSignals(session.configLoadChain, [session.controller.signal]);
+      if (session.probePromises.size > 0) {
+        await Promise.allSettled([...session.probePromises.values()]);
+      }
+
+      const trimmed = args.trim();
+      if (!trimmed) {
+        const available = session.prompts.cachedPrompts();
+        if (available.length === 0) {
+          if (ctx.hasUI) ctx.ui.notify("No MCP 2026-07-28 prompts discovered on connected servers.", "info");
+          return;
+        }
+        if (!ctx.hasUI) return;
+        const labels = available.map(
+          ({ server, prompt }) =>
+            `${server}/${prompt.name}${prompt.description ? ` — ${prompt.description}` : ""}`,
+        );
+        const picked = await ctx.ui.select("Select an MCP prompt", labels);
+        if (!picked) return;
+        const idx = labels.indexOf(picked);
+        if (idx < 0) return;
+        const chosen = available[idx];
+        await executeSlashPrompt(chosen.server, chosen.prompt.name, "", ctx);
+        return;
+      }
+
+      const spaceIdx = trimmed.indexOf(" ");
+      const head = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+      const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1);
+      const slashIdx = head.indexOf("/");
+      if (slashIdx <= 0 || slashIdx === head.length - 1) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /mcp-prompt <server>/<prompt> [key=value ...]", "warning");
+        return;
+      }
+      await executeSlashPrompt(head.slice(0, slashIdx), head.slice(slashIdx + 1), rest, ctx);
+    },
+  });
+
   pi.registerMessageRenderer(
     MESSAGE_EVENT,
     createExpandableJsonRenderer(MESSAGE_EVENT, summarizeEventDetails),
@@ -1174,6 +1578,10 @@ export default function extension(pi: ExtensionAPI): void {
   pi.registerMessageRenderer(
     MESSAGE_TASK,
     createExpandableJsonRenderer(MESSAGE_TASK, summarizeTaskDetails),
+  );
+  pi.registerMessageRenderer(
+    MESSAGE_RESOURCE,
+    createExpandableJsonRenderer(MESSAGE_RESOURCE, summarizeResourceDetails),
   );
 
   pi.registerTool({
@@ -1489,6 +1897,337 @@ export default function extension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerTool({
+    name: "mcp_resources",
+    label: "MCP Resources",
+    description:
+      "List, read, browse directories, or subscribe to live updates on MCP 2026-07-28 server resources.",
+    exposure: "direct",
+    parameters: McpResourcesParams,
+    async execute(
+      _toolCallId: string,
+      params: McpResourcesInput,
+      signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionToolContext,
+    ): Promise<AgentToolResult<unknown>> {
+      if (currentSession && ctx) currentSession.latestCtx = ctx;
+
+      if (params.action === "subscriptions") {
+        if (!currentSession || currentSession.controller.signal.aborted) {
+          return jsonResult([]);
+        }
+        const session = currentSession;
+        await raceWithSignals(session.configLoadChain, [signal, session.controller.signal]);
+        if (session.probePromises.size > 0) {
+          await raceWithSignals(
+            Promise.allSettled([...session.probePromises.values()]),
+            [signal, session.controller.signal],
+          );
+        }
+        updateFooter(session, ctx);
+        return jsonResult(session.resources.subscriptions(params.server));
+      }
+
+      if (!params.server) {
+        throw new Error(`mcp_resources action "${params.action}" requires parameter "server".`);
+      }
+      const session = requireActiveSession();
+
+      if (params.action === "unsubscribe") {
+        if (!params.uri) {
+          throw new Error('mcp_resources action "unsubscribe" requires parameter "uri".');
+        }
+        const removed = session.resources.unsubscribe(params.server, params.uri);
+        updateFooter(session, ctx);
+        return jsonResult({ server: params.server, uri: params.uri, removed });
+      }
+
+      await ensureModernCapability(session, params.server, "resources", signal);
+      const collector = createLogCollector(params.server, params.logLevel);
+
+      try {
+        switch (params.action) {
+          case "list": {
+            const out = await session.resources.list(params.server, params.cursor, collector.opts);
+            return jsonResult({ server: params.server, ...out }, collector.logs);
+          }
+          case "templates": {
+            const out = await session.resources.templates(
+              params.server,
+              params.cursor,
+              collector.opts,
+            );
+            return jsonResult({ server: params.server, ...out }, collector.logs);
+          }
+          case "read": {
+            if (!params.uri) {
+              throw new Error('mcp_resources action "read" requires parameter "uri".');
+            }
+            const out = await session.resources.read(params.server, params.uri, collector.opts);
+            const content: Array<TextContent | ImageContent> = [...out.blocks];
+            if (collector.logs.length > 0) {
+              content.push({ type: "text", text: collector.logs.join("\n") });
+            }
+            return {
+              content,
+              structuredContent: { server: params.server, uri: params.uri, contents: out.contents },
+              details: { server: params.server, uri: params.uri, contents: out.contents },
+            } as AgentToolResult<unknown>;
+          }
+          case "directory": {
+            if (!params.uri) {
+              throw new Error('mcp_resources action "directory" requires parameter "uri".');
+            }
+            const out = await session.resources.directory(
+              params.server,
+              params.uri,
+              params.cursor,
+              collector.opts,
+            );
+            return jsonResult({ server: params.server, uri: params.uri, ...out }, collector.logs);
+          }
+          case "subscribe": {
+            if (!params.uri) {
+              throw new Error('mcp_resources action "subscribe" requires parameter "uri".');
+            }
+            const mode = ctx?.mode ?? session.latestCtx?.mode;
+            const defaultHold = mode === "print" || mode === "json";
+            const rec = session.resources.subscribe(
+              params.server,
+              params.uri,
+              params.holdSettle ?? defaultHold,
+            );
+            updateFooter(session, ctx);
+            return jsonResult(rec);
+          }
+        }
+      } catch (err) {
+        throw normalizeServerCallError(params.server, err);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "mcp_prompts",
+    label: "MCP Prompts",
+    description:
+      "List MCP 2026-07-28 prompts, retrieve rendered prompt messages, or autocomplete prompt/resource arguments.",
+    exposure: "direct",
+    parameters: McpPromptsParams,
+    async execute(
+      _toolCallId: string,
+      params: McpPromptsInput,
+      signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionToolContext,
+    ): Promise<AgentToolResult<unknown>> {
+      if (currentSession && ctx) currentSession.latestCtx = ctx;
+      const session = requireActiveSession();
+      const collector = createLogCollector(params.server, params.logLevel);
+
+      try {
+        switch (params.action) {
+          case "list": {
+            await ensureModernCapability(session, params.server, "prompts", signal);
+            const prompts = await session.prompts.list(params.server, collector.opts);
+            return jsonResult({ server: params.server, prompts }, collector.logs);
+          }
+          case "get": {
+            if (!params.name) {
+              throw new Error('mcp_prompts action "get" requires parameter "name".');
+            }
+            await ensureModernCapability(session, params.server, "prompts", signal);
+            const res = await session.prompts.get(
+              params.server,
+              params.name,
+              params.arguments,
+              collector.opts,
+            );
+            const content: Array<TextContent | ImageContent> = [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    server: params.server,
+                    name: params.name,
+                    ...(res.description ? { description: res.description } : {}),
+                    messages: res.messages,
+                    renderedText: res.renderedText,
+                  },
+                  null,
+                  2,
+                ),
+              },
+              ...res.images,
+            ];
+            if (collector.logs.length > 0) {
+              content.push({ type: "text", text: collector.logs.join("\n") });
+            }
+            return {
+              content,
+              details: { server: params.server, name: params.name, messages: res.messages },
+            };
+          }
+          case "complete": {
+            if (!params.argumentName) {
+              throw new Error('mcp_prompts action "complete" requires parameter "argumentName".');
+            }
+            await ensureModernCapability(session, params.server, "completions", signal);
+            const isResource = params.refType === "resource" || Boolean(params.uri && !params.name);
+            if (isResource) {
+              if (!params.uri) {
+                throw new Error('mcp_prompts resource completion requires parameter "uri".');
+              }
+              const out = await session.prompts.complete(
+                params.server,
+                { type: "ref/resource", uri: params.uri },
+                { name: params.argumentName, value: params.argumentValue ?? "" },
+                params.arguments,
+                collector.opts,
+              );
+              return jsonResult(out, collector.logs);
+            }
+            if (!params.name) {
+              throw new Error('mcp_prompts prompt completion requires parameter "name".');
+            }
+            const out = await session.prompts.complete(
+              params.server,
+              { type: "ref/prompt", name: params.name },
+              { name: params.argumentName, value: params.argumentValue ?? "" },
+              params.arguments,
+              collector.opts,
+            );
+            return jsonResult(out, collector.logs);
+          }
+        }
+      } catch (err) {
+        throw normalizeServerCallError(params.server, err);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "mcp_skills",
+    label: "MCP Skills",
+    description:
+      "Discover, verify, approve, and load Agent Skills over MCP (io.modelcontextprotocol/skills) and their supporting files.",
+    exposure: "direct",
+    parameters: McpSkillsParams,
+    async execute(
+      _toolCallId: string,
+      params: McpSkillsInput,
+      signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionToolContext,
+    ): Promise<AgentToolResult<unknown>> {
+      if (currentSession && ctx) currentSession.latestCtx = ctx;
+      const session = requireActiveSession();
+      await ensureModernCapability(session, params.server, "skills", signal);
+      const collector = createLogCollector(params.server, params.logLevel);
+
+      try {
+        switch (params.action) {
+          case "list": {
+            const skills = await session.skills.list(params.server, collector.opts);
+            return jsonResult({ server: params.server, skills }, collector.logs);
+          }
+          case "get": {
+            if (!params.uri) {
+              throw new Error('mcp_skills action "get" requires parameter "uri".');
+            }
+            const skill = await session.skills.get(params.server, params.uri, collector.opts);
+            return jsonResult({ server: params.server, skill }, collector.logs);
+          }
+          case "load": {
+            if (!params.uri) {
+              throw new Error('mcp_skills action "load" requires parameter "uri".');
+            }
+            const loaded = await session.skills.load(params.server, params.uri, {
+              ...collector.opts,
+              approve: ctx?.hasUI
+                ? async ({ server, entry, fileCount, totalBytes }) => {
+                    const dynamicNote =
+                      entry.resources === "dynamic"
+                        ? "\nWARNING: Dynamic skill (content has no pinned SHA-256 manifest; approval applies to this load only)."
+                        : `\nManifest: ${fileCount} file(s), ${totalBytes} bytes (SHA-256 verified).`;
+                    const allowedToolsNote =
+                      entry.frontmatter["allowed-tools"] !== undefined
+                        ? `\nRequested allowed-tools: ${JSON.stringify(entry.frontmatter["allowed-tools"])}`
+                        : "";
+                    return ctx.ui.confirm(
+                      `Approve MCP skill "${entry.frontmatter.name}" from "${server}"?`,
+                      `URI: ${entry.uri}\nDescription: ${entry.frontmatter.description}${dynamicNote}${allowedToolsNote}`,
+                    );
+                  }
+                : undefined,
+            });
+            const framed =
+              `<mcp_skill server="${loaded.server}" uri="${loaded.uri}" name="${loaded.name}">\n` +
+              `${loaded.content}\n` +
+              `</mcp_skill>`;
+            const content: TextContent[] = [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    server: loaded.server,
+                    uri: loaded.uri,
+                    name: loaded.name,
+                    description: loaded.description,
+                    supportingUris: loaded.supportingUris,
+                    ...(loaded.cacheDir ? { cacheDir: loaded.cacheDir } : {}),
+                  },
+                  null,
+                  2,
+                ),
+              },
+              { type: "text", text: framed },
+            ];
+            if (collector.logs.length > 0) {
+              content.push({ type: "text", text: collector.logs.join("\n") });
+            }
+            return { content, details: loaded };
+          }
+          case "read_file": {
+            if (!params.uri) {
+              throw new Error('mcp_skills action "read_file" requires parameter "uri" (skill SKILL.md URI).');
+            }
+            if (!params.path) {
+              throw new Error('mcp_skills action "read_file" requires parameter "path".');
+            }
+            const file = await session.skills.readFile(
+              params.server,
+              params.uri,
+              params.path,
+              collector.opts,
+            );
+            return jsonResult(file, collector.logs);
+          }
+          case "directory": {
+            if (!params.uri) {
+              throw new Error('mcp_skills action "directory" requires parameter "uri".');
+            }
+            const dir = await session.skills.directory(
+              params.server,
+              params.uri,
+              params.cursor,
+              collector.opts,
+            );
+            return jsonResult({ server: params.server, uri: params.uri, ...dir }, collector.logs);
+          }
+        }
+      } catch (err) {
+        throw normalizeServerCallError(params.server, err);
+      }
+    },
+  });
+
+  pi.on("resources_discover", async () => {
+    const skillPaths = currentSession?.skills.verifiedSkillPaths() ?? [];
+    return skillPaths.length > 0 ? { skillPaths } : {};
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     if (currentSession) {
       await shutdownSession(currentSession, ctx);
@@ -1497,10 +2236,20 @@ export default function extension(pi: ExtensionAPI): void {
     const session = createSessionRuntime(pi, ctx);
     currentSession = session;
 
+    session.cleanups.push(
+      session.prompts.onPromptsChanged((serverName, prompts) => {
+        for (const prompt of prompts) {
+          ensurePerPromptCommand(serverName, prompt);
+        }
+      }),
+    );
+
     const branchEntries = ctx.sessionManager.getBranch();
     const allEntries = ctx.sessionManager.getEntries();
     session.events.restore(branchEntries, allEntries);
     session.tasks.restore(allEntries);
+    session.resources.restore(branchEntries);
+    session.skills.restore(allEntries);
     updateFooter(session, ctx);
 
     await queueConfigReload(session, {
@@ -1527,7 +2276,9 @@ export default function extension(pi: ExtensionAPI): void {
     const session = currentSession;
     if (!session || session.controller.signal.aborted) return;
     session.latestCtx = ctx;
-    session.events.restore(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries());
+    const branch = ctx.sessionManager.getBranch();
+    session.events.restore(branch, ctx.sessionManager.getEntries());
+    session.resources.restore(branch);
     updateFooter(session, ctx);
   });
 
@@ -1651,7 +2402,9 @@ export default function extension(pi: ExtensionAPI): void {
       }
 
       const isHolding = (): boolean =>
-        session.tasks.hasPending() || session.events.holdsSettle();
+        session.tasks.hasPending() ||
+        session.events.holdsSettle() ||
+        session.resources.holdsSettle();
 
       if (!isHolding() || ctx.hasPendingMessages()) {
         return undefined;

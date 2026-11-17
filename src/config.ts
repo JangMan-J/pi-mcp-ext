@@ -7,7 +7,8 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 const { validateMcpServerConfig } = await import(new URL("./core/mcp-servers.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href) as {
   validateMcpServerConfig(name: string, raw: unknown): string | Record<string, any>;
 };
-import type { AuthResolver, ConfigLoadOptions, ConfigScope, ConfigWarning, ProviderTokenLookup, ResolvedHttpServer, ResolvedServer } from "./types.ts";
+import { parseClientCredentialsConfig, createClientCredentialsResolver } from "./oauth-client-credentials.ts";
+import type { AuthResolver, ConfigLoadOptions, ConfigScope, ConfigWarning, McpExposure, ProviderTokenLookup, ResolvedHttpServer, ResolvedServer } from "./types.ts";
 
 export interface DeclaredSubscription {
   name: string;
@@ -89,10 +90,38 @@ export async function loadServerConfigs(opts: ConfigLoadOptions): Promise<{ serv
   for (const s of opts.sessionServers) add(s.name, s.config, "session");
   const servers: ConfiguredServer[] = [];
   for (const [name, { config: c, scope }] of entries) {
-    const base = { name, namespace: mcpNamespace(name), scope, enabled: c.enabled !== false, timeoutMs: (c.timeout ?? 60) * 1000 };
-    const server: ConfiguredServer = typeof c.url === "string" && c.type !== "stdio"
-      ? { ...base, transport: "http", url: c.url, headers: c.headers ?? {}, ...(c.auth ? { authProvider: c.auth.provider } : {}) }
-      : { ...base, transport: "stdio", command: c.command, args: c.args ?? [], env: c.env ?? {}, ...(c.cwd === undefined ? {} : { cwd: c.cwd }) };
+    const base = {
+      name,
+      namespace: mcpNamespace(name),
+      scope,
+      enabled: c.enabled !== false,
+      timeoutMs: (c.timeout ?? 60) * 1000,
+      ...(typeof c.description === "string" ? { description: c.description } : {}),
+      ...(typeof c.exposure === "string" ? { exposure: c.exposure as McpExposure } : {}),
+      ...(record(c.toolExposure) ? { toolExposure: c.toolExposure as Record<string, McpExposure> } : {}),
+    };
+    let server: ConfiguredServer;
+    if (typeof c.url === "string" && c.type !== "stdio") {
+      const cc = parseClientCredentialsConfig(c, c.url, scope);
+      if (cc.warning) warnings.push({ scope, server: name, message: cc.warning });
+      server = {
+        ...base,
+        transport: "http",
+        url: c.url,
+        headers: c.headers ?? {},
+        ...(c.auth ? { authProvider: c.auth.provider } : {}),
+        ...(cc.config ? { clientCredentials: cc.config } : {}),
+      };
+    } else {
+      server = {
+        ...base,
+        transport: "stdio",
+        command: c.command,
+        args: c.args ?? [],
+        env: c.env ?? {},
+        ...(c.cwd === undefined ? {} : { cwd: c.cwd }),
+      };
+    }
     if (c.subscribe !== undefined) {
       const sub = subscriptions(c.subscribe);
       if (sub) server.subscribe = sub;
@@ -102,7 +131,10 @@ export async function loadServerConfigs(opts: ConfigLoadOptions): Promise<{ serv
   }
   return { servers, warnings };
 }
-export function createAuthResolver(server: ResolvedHttpServer, providerToken: ProviderTokenLookup): AuthResolver {
+export function createAuthResolver(server: ResolvedHttpServer, providerToken: ProviderTokenLookup, fetchOverride?: typeof fetch): AuthResolver {
+  const ccResolver = server.clientCredentials
+    ? createClientCredentialsResolver(server, { fetch: fetchOverride, resolveValue: resolveConfigValue })
+    : undefined;
   const path = join(getAgentDir(), "mcp-auth.json");
   let signature = "", states: Record<string, any> = {}, last: string | undefined;
   function stored(): string | undefined {
@@ -121,11 +153,16 @@ export function createAuthResolver(server: ResolvedHttpServer, providerToken: Pr
     const header = Object.entries(server.headers).find(([key]) => key.toLowerCase() === "authorization");
     if (header) return resolveConfigValue(header[1]);
     if (server.authProvider) { const token = await providerToken(server.authProvider); return token ? `Bearer ${token}` : undefined; }
+    if (ccResolver) return ccResolver.authorization();
     return stored();
   }
   return {
     async authorization() { last = await resolve(); return last; },
     async refreshAfterUnauthorized() {
+      const header = Object.entries(server.headers).find(([key]) => key.toLowerCase() === "authorization");
+      if (!header && !server.authProvider && ccResolver) {
+        return ccResolver.refreshAfterUnauthorized();
+      }
       const before = last;
       await new Promise(resolve => setTimeout(resolve, 250));
       last = await resolve();

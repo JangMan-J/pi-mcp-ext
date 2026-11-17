@@ -10,6 +10,8 @@
 export const PROTOCOL_VERSION = "2026-07-28";
 export const EXT_EVENTS = "io.modelcontextprotocol/events";
 export const EXT_TASKS = "io.modelcontextprotocol/tasks";
+export const EXT_SKILLS = "io.modelcontextprotocol/skills";
+export const EXT_OAUTH_CLIENT_CREDENTIALS = "io.modelcontextprotocol/oauth-client-credentials";
 export const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
 export const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
 export const META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo";
@@ -152,6 +154,7 @@ export interface ServerCapabilities {
   tools?: JsonObject;
   resources?: JsonObject;
   prompts?: JsonObject;
+  completions?: JsonObject;
   [key: string]: unknown;
 }
 
@@ -167,6 +170,10 @@ export interface DiscoverResult {
 export interface ListenFilter {
   eventsListChanged?: boolean;
   taskIds?: string[];
+  toolsListChanged?: boolean;
+  promptsListChanged?: boolean;
+  resourcesListChanged?: boolean;
+  resourceSubscriptions?: string[];
 }
 
 export type McpLogLevel =
@@ -322,6 +329,25 @@ export interface Mcp2026Transport {
 // ---------------------------------------------------------------------------------------------
 
 export type ConfigScope = "global" | "project" | "session";
+export type McpExposure = "codemode" | "deferred" | "direct" | "hidden";
+export type JwtSigningAlgorithm = "RS256" | "RS384" | "RS512" | "ES256" | "ES384" | "ES512" | "EdDSA";
+
+export interface OAuthClientCredentialsConfig {
+  clientId: string;
+  /** Raw secret (expanded via resolveConfigValue on connect). Mutually exclusive or paired with privateKey. */
+  clientSecret?: string;
+  /** Raw PEM private key (expanded via resolveConfigValue on connect) for RFC 7523 private_key_jwt. */
+  privateKey?: string;
+  algorithm?: JwtSigningAlgorithm;
+  kid?: string;
+  scope?: string;
+  /** Pinned authorization server issuer identifier (validated strictly before sending credentials). */
+  issuer?: string;
+  /** Explicit authorization server metadata URL override (https or loopback). */
+  authServerMetadataUrl?: string;
+  /** Explicit token endpoint URL override (https or loopback; requires issuer for private_key_jwt). */
+  tokenEndpoint?: string;
+}
 
 interface ResolvedServerBase {
   name: string;
@@ -331,6 +357,9 @@ interface ResolvedServerBase {
   enabled: boolean;
   /** `config.timeout` (seconds, default 60) in ms. */
   timeoutMs: number;
+  description?: string;
+  exposure?: McpExposure;
+  toolExposure?: Record<string, McpExposure>;
 }
 
 export interface ResolvedStdioServer extends ResolvedServerBase {
@@ -349,6 +378,8 @@ export interface ResolvedHttpServer extends ResolvedServerBase {
   headers: Record<string, string>;
   /** Set only when allowed (global or session scope, https or loopback URL). */
   authProvider?: string;
+  /** OAuth 2.0 client_credentials settings (allowed only in global or session scope on https or loopback). */
+  clientCredentials?: OAuthClientCredentialsConfig;
 }
 
 export type ResolvedServer = ResolvedStdioServer | ResolvedHttpServer;
@@ -412,6 +443,21 @@ export interface ServerState {
   eventsListChanged: boolean;
   /** `capabilities.extensions["io.modelcontextprotocol/tasks"]` present. */
   tasks: boolean;
+  /** `capabilities.tools` present. */
+  tools?: boolean;
+  toolsListChanged?: boolean;
+  /** `capabilities.resources` present. */
+  resources?: boolean;
+  resourcesSubscribe?: boolean;
+  resourcesListChanged?: boolean;
+  /** `capabilities.prompts` present. */
+  prompts?: boolean;
+  promptsListChanged?: boolean;
+  /** `capabilities.completions` present. */
+  completions?: boolean;
+  /** `capabilities.extensions["io.modelcontextprotocol/skills"]` AND `capabilities.resources` present. */
+  skills?: boolean;
+  skillsDirectoryRead?: boolean;
   serverInfo?: Implementation;
   instructions?: string;
 }
@@ -435,7 +481,7 @@ export interface ClientRequestOptions {
 }
 
 /** Interest a module registers in the server's single `subscriptions/listen` stream. */
-export type ListenOwner = "events" | "tasks";
+export type ListenOwner = "events" | "tasks" | "tools" | "prompts" | "resources";
 
 export interface ServerClient {
   readonly name: string;
@@ -470,6 +516,8 @@ export interface ServerClient {
   onListenNotification(listener: (msg: JSONRPCNotification) => void): () => void;
   /** Fires with the honored filter on every acknowledgment, and with undefined when the stream drops or closes. */
   onListenState(listener: (honored: ListenFilter | undefined) => void): () => void;
+  /** Close any open idle transport without permanently closing the client (reconnects lazily on next call). */
+  park?(): Promise<void>;
   /** Cancel streams and close the transport. Idempotent. */
   close(): Promise<void>;
 }
@@ -481,8 +529,11 @@ export interface ServerClient {
 export const CUSTOM_SUBSCRIPTIONS = "mcp-ext:subscriptions";
 export const CUSTOM_CURSORS = "mcp-ext:cursors";
 export const CUSTOM_TASKS = "mcp-ext:tasks";
+export const CUSTOM_RESOURCE_SUBSCRIPTIONS = "mcp-ext:resource-subscriptions";
+export const CUSTOM_SKILL_APPROVALS = "mcp-ext:skill-approvals";
 export const MESSAGE_EVENT = "mcp-event";
 export const MESSAGE_TASK = "mcp-task";
+export const MESSAGE_RESOURCE = "mcp-resource";
 
 export type DeliveryPreference = "auto" | "push" | "poll";
 
@@ -532,9 +583,14 @@ export interface EngineHost {
   /** `pi.appendEntry(customType, data)`. */
   appendEntry(customType: string, data: unknown): void;
   /** Steer a wake message: `pi.sendMessage({customType, content, display: true, details}, {triggerTurn: true, deliverAs: "steer"})`. */
-  wake(customType: typeof MESSAGE_EVENT | typeof MESSAGE_TASK, content: string, details: unknown): void;
+  wake(customType: typeof MESSAGE_EVENT | typeof MESSAGE_TASK | typeof MESSAGE_RESOURCE, content: string, details: unknown): void;
   /** Footer status / diagnostics; may be a no-op. */
   log(level: "info" | "warn" | "error", message: string): void;
+  /** Optional interactive elicitation handler for SEP-2663 input_required tasks when UI is present. */
+  fulfillElicitation?(
+    server: string,
+    params: JsonObject,
+  ): Promise<{ action: "accept" | "decline" | "cancel"; content?: JsonObject } | undefined>;
   /** Aborted on session_shutdown. */
   readonly signal: AbortSignal;
 }

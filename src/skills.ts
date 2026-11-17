@@ -1,0 +1,651 @@
+/**
+ * Skills over MCP (`io.modelcontextprotocol/skills`, `SEP-2640` / `extensions/skills/overview.md`).
+ *
+ * Implements `skills/list` and `skills/get` without eager file fetches, manifest-bound user
+ * approval (revoked automatically when any file URI/digest/frontmatter changes, and never
+ * persisted across loads for `"dynamic"` manifests), strict SHA-256 + byte-size + YAML
+ * frontmatter + parent-segment verification, origin-bound supporting-file reads, optional
+ * `resources/directory/read`, and an isolated read-only verified cache for Pi's `resources_discover`.
+ */
+
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, posix } from "node:path";
+import { canonicalJson } from "./events.ts";
+import { CUSTOM_SKILL_APPROVALS } from "./types.ts";
+import type {
+  EngineHost,
+  JsonObject,
+  McpLogLevel,
+  McpLogMessage,
+  ServerClient,
+} from "./types.ts";
+
+const MAX_SKILL_FILES = 512;
+const MAX_SKILL_BYTES = 16 * 1024 * 1024; // 16 MiB
+
+export interface SkillResourceManifestItem {
+  uri: string;
+  digest: string;
+  size: number;
+}
+
+export interface SkillEntry {
+  uri: string;
+  frontmatter: JsonObject & { name: string; description: string };
+  resources: SkillResourceManifestItem[] | "dynamic";
+}
+
+export interface LoadedSkillResult {
+  server: string;
+  uri: string;
+  name: string;
+  description: string;
+  frontmatter: JsonObject;
+  content: string;
+  cacheDir?: string;
+  supportingUris: string[];
+}
+
+type LogOpts = { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void };
+
+export interface SkillsEngineApi {
+  restore(allEntries: readonly unknown[]): void;
+  list(server: string, opts?: LogOpts): Promise<SkillEntry[]>;
+  get(server: string, uri: string, opts?: LogOpts): Promise<SkillEntry>;
+  load(
+    server: string,
+    uri: string,
+    opts?: LogOpts & {
+      approve?: (info: {
+        server: string;
+        entry: SkillEntry;
+        fileCount: number | "dynamic";
+        totalBytes: number | "dynamic";
+      }) => Promise<boolean>;
+    },
+  ): Promise<LoadedSkillResult>;
+  readFile(server: string, skillUri: string, fileUriOrRelativePath: string, opts?: LogOpts): Promise<{
+    server: string;
+    skillUri: string;
+    uri: string;
+    content: string;
+    size: number;
+  }>;
+  directory(
+    server: string,
+    uri: string,
+    cursor?: string,
+    opts?: LogOpts,
+  ): Promise<{ resources: Array<{ uri: string; name: string; mimeType?: string }>; nextCursor?: string }>;
+  verifiedSkillPaths(): string[];
+  shutdown(): Promise<void>;
+}
+
+function isRecord(v: unknown): v is JsonObject {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function sha256Digest(bytes: Buffer): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function shortHash(input: string): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, 16);
+}
+
+function toReqOpts(opts?: LogOpts) {
+  return opts?.logLevel || opts?.onLog
+    ? {
+        ...(opts.logLevel ? { logLevel: opts.logLevel } : {}),
+        ...(opts.onLog ? { onLog: opts.onLog } : {}),
+      }
+    : undefined;
+}
+
+function parseYamlScalar(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (trimmed === "null" || trimmed === "~") return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    if (trimmed.startsWith('"')) {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return trimmed.slice(1, -1);
+      }
+    }
+    return trimmed.slice(1, -1).replace(/''/g, "'");
+  }
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    const inner = trimmed.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner.split(",").map((part) => parseYamlScalar(part));
+  }
+  return trimmed;
+}
+
+/** Parse YAML frontmatter at the start of a `SKILL.md` document. */
+export function parseSkillFrontmatter(markdown: string): JsonObject | undefined {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown);
+  if (!match) return undefined;
+  const lines = match[1].split(/\r?\n/);
+  const result: JsonObject = {};
+  let currentKey: string | undefined;
+  let currentArray: unknown[] | undefined;
+
+  for (const line of lines) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const arrayItem = /^\s+-\s+(.*)$/.exec(line);
+    if (arrayItem && currentKey && currentArray) {
+      currentArray.push(parseYamlScalar(arrayItem[1]));
+      continue;
+    }
+    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+    if (!kv) return undefined;
+    const [, key, rest] = kv;
+    if (rest.trim() === "") {
+      currentKey = key;
+      currentArray = [];
+      result[key] = currentArray;
+    } else {
+      currentKey = key;
+      currentArray = undefined;
+      result[key] = parseYamlScalar(rest);
+    }
+  }
+  return result;
+}
+
+function parentSegmentOfSkillUri(uri: string): string | undefined {
+  const withoutQuery = uri.split(/[?#]/, 1)[0];
+  const schemeSep = withoutQuery.indexOf("://");
+  const pathPart = schemeSep >= 0 ? withoutQuery.slice(schemeSep + 3) : withoutQuery;
+  const segments = pathPart.split("/").filter((s) => s.length > 0);
+  // e.g. skill://code-review/SKILL.md -> segments ["code-review", "SKILL.md"]
+  if (segments.length < 2) return undefined;
+  if (segments[segments.length - 1] !== "SKILL.md") return undefined;
+  return decodeURIComponent(segments[segments.length - 2]);
+}
+
+function skillRootPrefix(skillUri: string): string {
+  const idx = skillUri.lastIndexOf("/SKILL.md");
+  return idx >= 0 ? skillUri.slice(0, idx) : skillUri;
+}
+
+function resolveSkillChildUri(skillUri: string, ref: string): string {
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(ref)) {
+    return ref;
+  }
+  const root = skillRootPrefix(skillUri);
+  const normalizedRel = posix.normalize(ref).replace(/^\/+/, "");
+  if (normalizedRel.startsWith("..")) {
+    throw new Error(`Relative skill path "${ref}" escapes skill root`);
+  }
+  return `${root}/${normalizedRel}`;
+}
+
+function parseSkillEntry(raw: unknown): SkillEntry {
+  if (!isRecord(raw) || typeof raw.uri !== "string" || !isRecord(raw.frontmatter)) {
+    throw new Error("Invalid MCP skill entry: missing uri or frontmatter");
+  }
+  const fm = raw.frontmatter;
+  if (typeof fm.name !== "string" || !fm.name || typeof fm.description !== "string") {
+    throw new Error(`Invalid MCP skill entry "${raw.uri}": frontmatter requires name and description`);
+  }
+  const parentSeg = parentSegmentOfSkillUri(raw.uri);
+  if (parentSeg !== fm.name) {
+    throw new Error(
+      `Invalid MCP skill entry "${raw.uri}": parent directory "${parentSeg ?? ""}" does not match frontmatter.name "${fm.name}"`,
+    );
+  }
+
+  if (raw.resources === "dynamic") {
+    return {
+      uri: raw.uri,
+      frontmatter: fm as JsonObject & { name: string; description: string },
+      resources: "dynamic",
+    };
+  }
+
+  if (!Array.isArray(raw.resources) || raw.resources.length === 0) {
+    throw new Error(`Invalid MCP skill entry "${raw.uri}": resources manifest must be non-empty or "dynamic"`);
+  }
+  if (raw.resources.length > MAX_SKILL_FILES) {
+    throw new Error(
+      `MCP skill "${raw.uri}" exceeds maximum file limit (${raw.resources.length} > ${MAX_SKILL_FILES})`,
+    );
+  }
+
+  let totalBytes = 0;
+  let hasSkillMd = false;
+  const manifest: SkillResourceManifestItem[] = [];
+  for (const item of raw.resources) {
+    if (
+      !isRecord(item) ||
+      typeof item.uri !== "string" ||
+      typeof item.digest !== "string" ||
+      !item.digest.startsWith("sha256:") ||
+      typeof item.size !== "number" ||
+      !Number.isInteger(item.size) ||
+      item.size < 0
+    ) {
+      throw new Error(`Invalid manifest item in MCP skill "${raw.uri}"`);
+    }
+    totalBytes += item.size;
+    if (totalBytes > MAX_SKILL_BYTES) {
+      throw new Error(`MCP skill "${raw.uri}" exceeds 16 MiB limit`);
+    }
+    if (item.uri === raw.uri) hasSkillMd = true;
+    manifest.push({ uri: item.uri, digest: item.digest, size: item.size });
+  }
+  if (!hasSkillMd) {
+    throw new Error(`Invalid MCP skill "${raw.uri}": manifest does not include SKILL.md`);
+  }
+
+  return {
+    uri: raw.uri,
+    frontmatter: fm as JsonObject & { name: string; description: string },
+    resources: manifest,
+  };
+}
+
+function approvalFingerprint(server: string, entry: SkillEntry): string | undefined {
+  if (entry.resources === "dynamic") return undefined;
+  return sha256Digest(
+    Buffer.from(
+      canonicalJson({
+        server,
+        uri: entry.uri,
+        frontmatter: entry.frontmatter,
+        resources: entry.resources,
+      }),
+      "utf8",
+    ),
+  );
+}
+
+function writeReadOnlyFile(filePath: string, bytes: Buffer): void {
+  const dir = dirname(filePath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (existsSync(filePath)) {
+    try {
+      chmodSync(filePath, 0o600);
+    } catch {
+      /* ignore */
+    }
+  }
+  writeFileSync(filePath, bytes, { mode: 0o444 });
+  try {
+    chmodSync(filePath, 0o444);
+  } catch {
+    /* ignore */
+  }
+}
+
+export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
+  const retained = new Map<string, SkillEntry>(); // key: `${server}\0${uri}`
+  const approvedFingerprints = new Set<string>();
+  const verifiedDirs = new Map<string, { dir: string; expectedDigest: string; skillMdPath: string }>();
+  const cacheRoot = join(
+    tmpdir(),
+    `pi-mcp-ext-skills-${process.getuid?.() ?? process.pid}-${shortHash(String(process.pid))}`,
+  );
+  let shutDown = false;
+
+  const entryKey = (server: string, uri: string) => `${server}\0${uri}`;
+  const onAbort = () => void shutdown();
+  host.signal?.addEventListener?.("abort", onAbort, { once: true });
+
+  function requireSkillsClient(server: string): ServerClient {
+    const client = host.getClient(server);
+    if (!client) throw new Error(`Unknown or not-ready MCP server: ${server}`);
+    if (!client.state.skills) {
+      throw new Error(
+        `MCP server "${server}" does not advertise both resources and io.modelcontextprotocol/skills.`,
+      );
+    }
+    return client;
+  }
+
+  function restore(allEntries: readonly unknown[]): void {
+    for (const raw of allEntries) {
+      if (!isRecord(raw) || raw.customType !== CUSTOM_SKILL_APPROVALS || !isRecord(raw.data)) {
+        continue;
+      }
+      const fp = raw.data.fingerprint;
+      if (typeof fp === "string" && fp.startsWith("sha256:")) {
+        approvedFingerprints.add(fp);
+      }
+    }
+  }
+
+  async function list(server: string, opts?: LogOpts): Promise<SkillEntry[]> {
+    const client = requireSkillsClient(server);
+    const out: SkillEntry[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    const reqOpts = toReqOpts(opts);
+    for (let page = 0; page < 32; page += 1) {
+      const res = await client.request<JsonObject>(
+        "skills/list",
+        cursor ? { cursor } : {},
+        reqOpts,
+      );
+      const rawSkills = Array.isArray(res.skills) ? res.skills : [];
+      for (const raw of rawSkills) {
+        const entry = parseSkillEntry(raw);
+        retained.set(entryKey(server, entry.uri), entry);
+        out.push(entry);
+      }
+      if (typeof res.nextCursor !== "string" || !res.nextCursor || seen.has(res.nextCursor)) {
+        break;
+      }
+      seen.add(res.nextCursor);
+      cursor = res.nextCursor;
+    }
+    return out;
+  }
+
+  async function get(server: string, uri: string, opts?: LogOpts): Promise<SkillEntry> {
+    const client = requireSkillsClient(server);
+    const res = await client.request<JsonObject>("skills/get", { uri }, toReqOpts(opts));
+    const entry = parseSkillEntry(res.skill);
+    retained.set(entryKey(server, entry.uri), entry);
+    return entry;
+  }
+
+  async function fetchRawResourceBytes(
+    client: ServerClient,
+    uri: string,
+    opts?: LogOpts,
+  ): Promise<{ bytes: Buffer; text: string }> {
+    const res = await client.request<JsonObject>("resources/read", { uri }, toReqOpts(opts));
+    const contents = Array.isArray(res.contents) ? res.contents.filter(isRecord) : [];
+    const first = contents[0];
+    if (!first) {
+      throw new Error(`Empty resources/read response for skill resource "${uri}"`);
+    }
+    if (typeof first.text === "string") {
+      return { bytes: Buffer.from(first.text, "utf8"), text: first.text };
+    }
+    if (typeof first.blob === "string") {
+      const bytes = Buffer.from(first.blob, "base64");
+      return { bytes, text: bytes.toString("utf8") };
+    }
+    throw new Error(`Skill resource "${uri}" contained neither text nor blob`);
+  }
+
+  async function refreshOnVerificationFailure(server: string, uri: string): Promise<void> {
+    try {
+      await get(server, uri);
+    } catch {
+      retained.delete(entryKey(server, uri));
+    }
+  }
+
+  async function load(
+    server: string,
+    uri: string,
+    opts?: LogOpts & {
+      approve?: (info: {
+        server: string;
+        entry: SkillEntry;
+        fileCount: number | "dynamic";
+        totalBytes: number | "dynamic";
+      }) => Promise<boolean>;
+    },
+  ): Promise<LoadedSkillResult> {
+    const client = requireSkillsClient(server);
+    const k = entryKey(server, uri);
+    const entry = retained.get(k) ?? (await get(server, uri, opts));
+
+    const fp = approvalFingerprint(server, entry);
+    const alreadyApproved = fp !== undefined && approvedFingerprints.has(fp);
+    if (!alreadyApproved && opts?.approve) {
+      const fileCount = entry.resources === "dynamic" ? "dynamic" : entry.resources.length;
+      const totalBytes =
+        entry.resources === "dynamic"
+          ? "dynamic"
+          : entry.resources.reduce((acc, item) => acc + item.size, 0);
+      const approved = await opts.approve({ server, entry, fileCount, totalBytes });
+      if (!approved) {
+        throw new Error(`User declined loading MCP skill "${entry.frontmatter.name}" from "${server}".`);
+      }
+      if (fp !== undefined) {
+        approvedFingerprints.add(fp);
+        host.appendEntry(CUSTOM_SKILL_APPROVALS, {
+          server,
+          uri: entry.uri,
+          fingerprint: fp,
+          approvedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    const { bytes, text } = await fetchRawResourceBytes(client, entry.uri, opts);
+    if (bytes.length > MAX_SKILL_BYTES) {
+      await refreshOnVerificationFailure(server, entry.uri);
+      throw new Error(`MCP skill "${entry.uri}" exceeded 16 MiB byte limit`);
+    }
+
+    if (entry.resources !== "dynamic") {
+      const manifestItem = entry.resources.find((r) => r.uri === entry.uri);
+      if (!manifestItem) {
+        await refreshOnVerificationFailure(server, entry.uri);
+        throw new Error(`MCP skill "${entry.uri}" missing SKILL.md in retained manifest`);
+      }
+      if (bytes.length !== manifestItem.size) {
+        await refreshOnVerificationFailure(server, entry.uri);
+        throw new Error(
+          `MCP skill "${entry.uri}" size mismatch: expected ${manifestItem.size} bytes, got ${bytes.length}; refreshed entry`,
+        );
+      }
+      const actualDigest = sha256Digest(bytes);
+      if (actualDigest !== manifestItem.digest) {
+        await refreshOnVerificationFailure(server, entry.uri);
+        throw new Error(
+          `MCP skill "${entry.uri}" SHA-256 digest mismatch: expected ${manifestItem.digest}, got ${actualDigest}; refreshed entry`,
+        );
+      }
+    }
+
+    const parsedFm = parseSkillFrontmatter(text);
+    if (!parsedFm || canonicalJson(parsedFm) !== canonicalJson(entry.frontmatter)) {
+      await refreshOnVerificationFailure(server, entry.uri);
+      throw new Error(
+        `MCP skill "${entry.uri}" frontmatter mismatch against retained entry; refreshed entry`,
+      );
+    }
+
+    let cacheDir: string | undefined;
+    if (entry.resources !== "dynamic") {
+      const skillParent = join(cacheRoot, shortHash(server), shortHash(entry.uri), entry.frontmatter.name);
+      const skillMdPath = join(skillParent, "SKILL.md");
+      writeReadOnlyFile(skillMdPath, bytes);
+      const digest = sha256Digest(bytes);
+      verifiedDirs.set(k, {
+        dir: dirname(skillParent),
+        expectedDigest: digest,
+        skillMdPath,
+      });
+      cacheDir = skillParent;
+    }
+
+    const supportingUris =
+      entry.resources === "dynamic"
+        ? []
+        : entry.resources.filter((r) => r.uri !== entry.uri).map((r) => r.uri);
+
+    return {
+      server,
+      uri: entry.uri,
+      name: entry.frontmatter.name,
+      description: entry.frontmatter.description,
+      frontmatter: entry.frontmatter,
+      content: text,
+      ...(cacheDir ? { cacheDir } : {}),
+      supportingUris,
+    };
+  }
+
+  async function readFile(
+    server: string,
+    skillUri: string,
+    fileUriOrRelativePath: string,
+    opts?: LogOpts,
+  ): Promise<{ server: string; skillUri: string; uri: string; content: string; size: number }> {
+    const client = requireSkillsClient(server);
+    const k = entryKey(server, skillUri);
+    const entry = retained.get(k);
+    if (!entry) {
+      throw new Error(
+        `MCP skill "${skillUri}" on server "${server}" must be loaded before reading supporting files.`,
+      );
+    }
+    const targetUri = resolveSkillChildUri(skillUri, fileUriOrRelativePath);
+
+    if (entry.resources !== "dynamic") {
+      const manifestItem = entry.resources.find((r) => r.uri === targetUri);
+      if (!manifestItem) {
+        throw new Error(
+          `URI "${targetUri}" is not in the retained manifest of skill "${skillUri}" on "${server}"`,
+        );
+      }
+      const { bytes, text } = await fetchRawResourceBytes(client, targetUri, opts);
+      if (bytes.length !== manifestItem.size) {
+        await refreshOnVerificationFailure(server, skillUri);
+        throw new Error(
+          `Supporting file "${targetUri}" size mismatch (expected ${manifestItem.size}, got ${bytes.length}); refreshed skill entry`,
+        );
+      }
+      const actualDigest = sha256Digest(bytes);
+      if (actualDigest !== manifestItem.digest) {
+        await refreshOnVerificationFailure(server, skillUri);
+        throw new Error(
+          `Supporting file "${targetUri}" SHA-256 mismatch (expected ${manifestItem.digest}, got ${actualDigest}); refreshed skill entry`,
+        );
+      }
+      return { server, skillUri, uri: targetUri, content: text, size: bytes.length };
+    }
+
+    const { bytes, text } = await fetchRawResourceBytes(client, targetUri, opts);
+    if (bytes.length > MAX_SKILL_BYTES) {
+      throw new Error(`Supporting file "${targetUri}" exceeded 16 MiB limit`);
+    }
+    return { server, skillUri, uri: targetUri, content: text, size: bytes.length };
+  }
+
+  async function directory(
+    server: string,
+    uri: string,
+    cursor?: string,
+    opts?: LogOpts,
+  ): Promise<{ resources: Array<{ uri: string; name: string; mimeType?: string }>; nextCursor?: string }> {
+    const client = requireSkillsClient(server);
+    const cleanUri = uri.length > 1 && uri.endsWith("/") ? uri.slice(0, -1) : uri;
+
+    // Answer directly from retained static manifest when available (`skills/overview.md` §Reading Directories)
+    for (const [k, entry] of retained) {
+      if (!k.startsWith(`${server}\0`) || entry.resources === "dynamic") continue;
+      const root = skillRootPrefix(entry.uri);
+      if (cleanUri === root || cleanUri.startsWith(`${root}/`)) {
+        const prefix = `${cleanUri}/`;
+        const children = new Map<string, { uri: string; name: string; mimeType?: string }>();
+        for (const item of entry.resources) {
+          if (!item.uri.startsWith(prefix)) continue;
+          const rest = item.uri.slice(prefix.length);
+          const slashIdx = rest.indexOf("/");
+          if (slashIdx === -1) {
+            children.set(rest, { uri: item.uri, name: rest });
+          } else {
+            const dirName = rest.slice(0, slashIdx);
+            children.set(dirName, {
+              uri: `${prefix}${dirName}`,
+              name: dirName,
+              mimeType: "inode/directory",
+            });
+          }
+        }
+        return { resources: [...children.values()] };
+      }
+    }
+
+    if (!client.state.skillsDirectoryRead) {
+      throw new Error(
+        `MCP server "${server}" does not declare directoryRead: true in io.modelcontextprotocol/skills.`,
+      );
+    }
+    const res = await client.request<JsonObject>(
+      "resources/directory/read",
+      { uri: cleanUri, ...(cursor ? { cursor } : {}) },
+      toReqOpts(opts),
+    );
+    const rawList = Array.isArray(res.resources) ? res.resources : [];
+    const resources = rawList
+      .filter(isRecord)
+      .filter((r) => typeof r.uri === "string" && typeof r.name === "string")
+      .map((r) => ({
+        uri: r.uri as string,
+        name: r.name as string,
+        ...(typeof r.mimeType === "string" ? { mimeType: r.mimeType } : {}),
+      }));
+    return {
+      resources,
+      ...(typeof res.nextCursor === "string" ? { nextCursor: res.nextCursor } : {}),
+    };
+  }
+
+  function verifiedSkillPaths(): string[] {
+    if (shutDown) return [];
+    const paths: string[] = [];
+    for (const [k, item] of verifiedDirs) {
+      try {
+        const st = statSync(item.skillMdPath);
+        if (!st.isFile()) {
+          verifiedDirs.delete(k);
+          continue;
+        }
+        const bytes = readFileSync(item.skillMdPath);
+        if (sha256Digest(bytes) !== item.expectedDigest) {
+          verifiedDirs.delete(k);
+          continue;
+        }
+        paths.push(item.dir);
+      } catch {
+        verifiedDirs.delete(k);
+      }
+    }
+    return [...new Set(paths)];
+  }
+
+  async function shutdown(): Promise<void> {
+    if (shutDown) return;
+    shutDown = true;
+    host.signal?.removeEventListener?.("abort", onAbort);
+    verifiedDirs.clear();
+    retained.clear();
+    try {
+      rmSync(cacheRoot, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return {
+    restore,
+    list,
+    get,
+    load,
+    readFile,
+    directory,
+    verifiedSkillPaths,
+    shutdown,
+  };
+}

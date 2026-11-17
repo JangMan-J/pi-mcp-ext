@@ -1,17 +1,21 @@
 # @jangmanj/pi-mcp-ext
 
-Stateless MCP `2026-07-28` events and asynchronous tasks for Pi, running alongside `builtin:mcp`.
+Stateless MCP `2026-07-28` capabilities for Pi, running alongside `builtin:mcp`.
 
 ## What It Adds Next to `builtin:mcp`
 
-Pi's `builtin:mcp` extension owns `/mcp`, synchronous `mcp__<server>__<tool>` tool exposure, resource tools, and `mcp-auth.json` sign-in and token refresh. `@jangmanj/pi-mcp-ext` loads in the same Pi session without replacing `builtin:mcp` and adds the `2026-07-28` protocol capabilities on configured `stdio` and Streamable HTTP servers:
+Pi's `builtin:mcp` extension speaks MCP `2025-11-25` and owns `/mcp`, synchronous `mcp__<server>__<tool>` tools on `2025-11-25` servers, `list_mcp_resources` / `read_mcp_resource`, and interactive `mcp-auth.json` sign-in. `@jangmanj/pi-mcp-ext` loads in the same Pi session without replacing `builtin:mcp` and adds the full `2026-07-28` surface on configured `stdio` and Streamable HTTP servers:
 
-- **Stateless discovery and change streams**: probes enabled servers with `server/discover` (falling back cleanly when a server speaks an older MCP version) and maintains at most one `subscriptions/listen` stream per modern server when needed.
-- **Events (`io.modelcontextprotocol/events`)**: discovers event types via `events/list`, catches up with `events/poll`, streams live occurrences via `events/stream`, persists replay cursors in the session branch, deduplicates deliveries, and wakes Pi turns with `mcp-event` messages (`poll` and `push` delivery; `webhook`-only event types are skipped since a local CLI session has no inbound webhook endpoint).
-- **Tasks (`io.modelcontextprotocol/tasks`)**: invokes task-augmented MCP tools, tracks `working` and `input_required` tasks across `subscriptions/listen` push notifications and fallback `tasks/get` polling, supplies interactive input via `tasks/update`, cancels via `tasks/cancel`, and wakes Pi turns with `mcp-task` messages.
-- **Task-capability hint**: when a synchronous `mcp__<server>__<tool>` call fails with `-32021` naming `io.modelcontextprotocol/tasks` on a server that supports tasks, appends a hint showing the equivalent `mcp_tasks` call.
-- **Headless settle hold**: keeps `-p` and `--mode json` runs alive while non-terminal tasks or `holdSettle` event subscriptions are active, settling cleanly once deliveries drain.
-- **Read-only configuration and credentials**: reads global `mcp.json`, trusted project `.pi/mcp.json`, session-registered servers, and `mcp-auth.json` without writing or locking config or credential files.
+- **Stateless discovery and unified `subscriptions/listen` multiplexer**: probes enabled servers with `server/discover` (closing dormant probes cleanly on legacy `2025-11-25` servers) and shares at most one `subscriptions/listen` stream per server across events, tasks, tools, prompts, and resource watches.
+- **Pure `2026-07-28` tools fallback**: when a strict `2026-07-28` server drops `initialize` so `builtin:mcp` cannot register its `mcp__<server>__*` tools, automatically registers them with full `exposure` / `toolExposure` parity and live `toolsListChanged` updates—standing down completely on dual-stack servers where `builtin:mcp` succeeded.
+- **Prompts & Argument Completion (`mcp_prompts`, `/mcp-prompt`, `/mcp-prompt:<server>:<prompt>`)**: discovers server prompts via `prompts/list`, refreshes on `promptsListChanged`, autocompletes prompt and resource-template arguments via `completion/complete`, and sends resolved prompt messages.
+- **Resources & Live Resource Subscriptions (`mcp_resources`)**: lists resources/templates, reads text/image/binary resources (`resources/read`), browses directories (`resources/directory/read`), and watches `resourceSubscriptions` / `resourcesListChanged` on `subscriptions/listen` with `mcp-resource` turn wakes.
+- **Events (`io.modelcontextprotocol/events`, `mcp_events`)**: discovers event types via `events/list`, catches up with `events/poll`, streams live occurrences via `events/stream`, persists replay cursors in the session branch, deduplicates deliveries, and wakes Pi turns with `mcp-event` messages (`poll` and `push` delivery; `webhook`-only event types are skipped since a local CLI session has no inbound webhook endpoint).
+- **Tasks (`io.modelcontextprotocol/tasks`, `mcp_tasks`) + Interactive Elicitation (`form` & `url`)**: invokes task-augmented tools, tracks `working` and `input_required` tasks across `subscriptions/listen` and fallback `tasks/get` polling, fulfills interactive `elicitation/create` requests directly via `ctx.ui` (flat primitive forms with review/modify + safe domain-verified external URL consent) before calling `tasks/update`, cancels via `tasks/cancel`, and wakes Pi turns with `mcp-task` messages.
+- **Skills over MCP (`io.modelcontextprotocol/skills`, `mcp_skills` + `resources_discover`)**: discovers skill manifests without eager file fetches, enforces manifest-bound user approval, verifies exact byte sizes + `sha256:` digests + YAML frontmatter + parent directory names, and mounts verified read-only skill caches into Pi's `resources_discover`.
+- **OAuth 2.0 Client Credentials (`io.modelcontextprotocol/oauth-client-credentials`)**: unattended machine-to-machine `client_secret` and RFC 7523 / RFC 10070 `private_key_jwt` (`RS*`, `ES*`, `EdDSA`) authentication with RFC 9728 / RFC 8414 discovery, strict issuer pinning, and in-memory token refresh.
+- **OpenTelemetry Trace Context (`_meta`)**: propagates valid W3C `traceparent`, `tracestate`, and `baggage` fields into outbound `_meta`.
+- **Task-capability hint, headless settle hold, and read-only config**: hints equivalent `mcp_tasks` calls on `-32021`, holds `-p` / `--mode json` open while tasks or `holdSettle` subscriptions/watches are active, and never writes or locks `mcp.json` or `mcp-auth.json`.
 
 ## Install
 
@@ -21,7 +25,7 @@ pi install npm:@jangmanj/pi-mcp-ext
 
 ## Tools
 
-Both tools register directly (and are callable from `codemode` scripts as `tools.mcp_events(...)` and `tools.mcp_tasks(...)`).
+All five tools register directly (and are callable from `codemode` scripts as `tools.mcp_events(...)`, `tools.mcp_tasks(...)`, `tools.mcp_resources(...)`, `tools.mcp_prompts(...)`, and `tools.mcp_skills(...)`).
 
 ### `mcp_events`
 
@@ -51,6 +55,59 @@ Invoke and manage MCP `2026-07-28` task-augmented tool calls.
 - `logLevel?: "debug" | "info" | "notice" | "warning" | "error" | "critical" | "alert" | "emergency"` — per-request `SEP-2575` `io.modelcontextprotocol/logLevel` for `call`, `get`, `update`, and `cancel`; request-scoped `notifications/message` frames are appended to the tool result.
 
 `action: "active"` reads the client's session task ledger directly without issuing a server RPC.
+
+### `mcp_resources`
+
+Read, browse, and subscribe to live updates on `2026-07-28` server resources.
+
+- `action`: `"list" | "templates" | "read" | "directory" | "subscribe" | "unsubscribe" | "subscriptions"`
+- `server?: string` — MCP server name (required except for `subscriptions`).
+- `uri?: string` — resource or directory URI (required for `read`, `directory`, `subscribe`, `unsubscribe`).
+- `cursor?: string` — pagination cursor for `list`, `templates`, or `directory`.
+- `holdSettle?: boolean` — keep headless (`-p` / `--mode json`) runs open while watching `uri`.
+- `logLevel?` — per-request `SEP-2575` log level.
+
+### `mcp_prompts` & `/mcp-prompt`
+
+Discover prompts, render prompt messages, or autocomplete prompt/resource arguments (`completion/complete`).
+
+- `action`: `"list" | "get" | "complete"`
+- `server: string` — MCP server name.
+- `name?: string` — prompt name (for `get` or `complete` with `refType: "prompt"`).
+- `uri?: string` — resource URI or template (for `complete` with `refType: "resource"`).
+- `arguments?: Record<string, string>` — prompt arguments for `get`, or resolved `context.arguments` for `complete`.
+- `argumentName?: string`, `argumentValue?: string` — active argument for `complete`.
+- Interactive slash commands: `/mcp-prompt` (interactive picker or `/mcp-prompt <server>/<prompt> key=value`) and dynamic per-prompt `/mcp-prompt:<server>:<prompt>` with live `completion/complete` argument suggestions.
+
+### `mcp_skills`
+
+Discover, verify, approve, and load Agent Skills over MCP (`io.modelcontextprotocol/skills`).
+
+- `action`: `"list" | "get" | "load" | "read_file" | "directory"`
+- `server: string` — MCP server name.
+- `uri?: string` — skill `SKILL.md` URI (for `get`, `load`, `read_file`) or directory URI (for `directory`).
+- `path?: string` — relative path or URI within the retained skill manifest (for `read_file`).
+- `cursor?: string` — pagination cursor for `directory`.
+
+## OAuth 2.0 Client Credentials (`clientCredentials`)
+
+Global `mcp.json` or session-registered HTTP servers (over `https:` or loopback) may configure unattended `io.modelcontextprotocol/oauth-client-credentials` using either `clientSecret` or RFC 7523 / RFC 10070 `privateKey` (`RS256`/`384`/`512`, `ES256`/`384`/`512`, `EdDSA`) with optional `issuer` pinning:
+
+```json
+{
+  "mcpServers": {
+    "ci-remote": {
+      "url": "https://mcp.example.com/mcp",
+      "clientCredentials": {
+        "clientId": "ci-worker",
+        "privateKey": "${CI_MCP_PRIVATE_KEY_PEM}",
+        "algorithm": "ES256",
+        "issuer": "https://auth.example.com"
+      }
+    }
+  }
+}
+```
 
 ## Declarative Subscriptions (`subscribe`)
 

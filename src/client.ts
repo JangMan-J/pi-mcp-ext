@@ -5,6 +5,8 @@ import {
   CLIENT_INFO,
   ErrorCode,
   EXT_EVENTS,
+  EXT_OAUTH_CLIENT_CREDENTIALS,
+  EXT_SKILLS,
   EXT_TASKS,
   META_CLIENT_CAPABILITIES,
   META_CLIENT_INFO,
@@ -38,14 +40,51 @@ import type {
   ServerState,
 } from "./types.ts";
 
-/** Stateless capabilities sent on every request (SEP-2575). */
-export function buildMeta(opts?: { roots?: boolean; elicitation?: boolean }): Record<string, unknown> {
-  const capabilities: JsonObject = {
-    extensions: { [EXT_EVENTS]: {}, [EXT_TASKS]: {} },
+const TRACEPARENT_RE = /^[0-9a-f]{2}-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-[0-9a-f]{2}$/;
+const PRINTABLE_HEADER_RE = /^[\t\x20-\x7e]+$/;
+
+/** Extract valid W3C OpenTelemetry trace context (`traceparent`, `tracestate`, `baggage`) (`basic/index.md`). */
+export function extractTraceMeta(
+  source?: Record<string, string | undefined>,
+): JsonObject {
+  const out: JsonObject = {};
+  if (!source) return out;
+  const tp = (source.traceparent ?? source.TRACEPARENT)?.trim();
+  if (tp && TRACEPARENT_RE.test(tp)) {
+    out.traceparent = tp;
+  }
+  const ts = (source.tracestate ?? source.TRACESTATE)?.trim();
+  if (ts && PRINTABLE_HEADER_RE.test(ts)) {
+    out.tracestate = ts;
+  }
+  const bag = (source.baggage ?? source.BAGGAGE)?.trim();
+  if (bag && PRINTABLE_HEADER_RE.test(bag)) {
+    out.baggage = bag;
+  }
+  return out;
+}
+
+export interface BuildMetaOptions {
+  roots?: boolean;
+  elicitation?: boolean;
+  skills?: boolean;
+  oauthClientCredentials?: boolean;
+  traceContext?: Record<string, string | undefined>;
+}
+
+/** Stateless capabilities and optional W3C trace context sent on every request (SEP-2575, SEP-414). */
+export function buildMeta(opts?: BuildMetaOptions): Record<string, unknown> {
+  const extensions: Record<string, JsonObject> = {
+    [EXT_EVENTS]: {},
+    [EXT_TASKS]: {},
   };
+  if (opts?.skills) extensions[EXT_SKILLS] = {};
+  if (opts?.oauthClientCredentials) extensions[EXT_OAUTH_CLIENT_CREDENTIALS] = {};
+  const capabilities: JsonObject = { extensions };
   if (opts?.roots) capabilities.roots = {};
   if (opts?.elicitation) capabilities.elicitation = { form: {}, url: {} };
   return {
+    ...extractTraceMeta(opts?.traceContext),
     [META_PROTOCOL_VERSION]: PROTOCOL_VERSION,
     [META_CLIENT_CAPABILITIES]: capabilities,
     [META_CLIENT_INFO]: { ...CLIENT_INFO },
@@ -89,6 +128,11 @@ function normalizeFilter(filter: ListenFilter): ListenFilter {
   if (filter.eventsListChanged === true) normalized.eventsListChanged = true;
   const taskIds = [...new Set(filter.taskIds ?? [])];
   if (taskIds.length) normalized.taskIds = taskIds;
+  if (filter.toolsListChanged === true) normalized.toolsListChanged = true;
+  if (filter.promptsListChanged === true) normalized.promptsListChanged = true;
+  if (filter.resourcesListChanged === true) normalized.resourcesListChanged = true;
+  const resourceSubs = [...new Set(filter.resourceSubscriptions ?? [])];
+  if (resourceSubs.length) normalized.resourceSubscriptions = resourceSubs;
   return normalized;
 }
 
@@ -156,7 +200,12 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     logLevel?: McpLogLevel,
   ): JSONRPCRequest {
     const requestParams: JsonObject = { ...params };
-    const meta: JsonObject = { ...(params?._meta as JsonObject | undefined), ...makeMeta() };
+    const meta: JsonObject = { ...makeMeta(), ...(params?._meta as JsonObject | undefined) };
+    // Always enforce protocol fields while allowing caller-supplied traceparent/progressToken in params._meta.
+    const coreMeta = makeMeta();
+    meta[META_PROTOCOL_VERSION] = coreMeta[META_PROTOCOL_VERSION];
+    meta[META_CLIENT_CAPABILITIES] = coreMeta[META_CLIENT_CAPABILITIES];
+    meta[META_CLIENT_INFO] = coreMeta[META_CLIENT_INFO];
     if (logLevel !== undefined) meta[META_LOG_LEVEL] = logLevel;
     requestParams._meta = meta;
     return { jsonrpc: "2.0", id, method, params: requestParams };
@@ -349,6 +398,16 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     state.events = false;
     state.eventsListChanged = false;
     state.tasks = false;
+    state.tools = false;
+    state.toolsListChanged = false;
+    state.resources = false;
+    state.resourcesSubscribe = false;
+    state.resourcesListChanged = false;
+    state.prompts = false;
+    state.promptsListChanged = false;
+    state.completions = false;
+    state.skills = false;
+    state.skillsDirectoryRead = false;
     state.serverInfo = undefined;
     state.instructions = undefined;
   }
@@ -397,13 +456,53 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       const extensions = result.capabilities?.extensions;
       const eventsExtension = extensions?.[EXT_EVENTS];
       const tasksExtension = extensions?.[EXT_TASKS];
+      const skillsExtension = extensions?.[EXT_SKILLS];
+      const toolsCap: unknown = result.capabilities?.tools;
+      const resourcesCap: unknown = result.capabilities?.resources;
+      const promptsCap: unknown = result.capabilities?.prompts;
+      const completionsCap: unknown = result.capabilities?.completions;
+
       state.events = eventsExtension !== undefined && eventsExtension !== false && eventsExtension !== null;
       state.tasks = tasksExtension !== undefined && tasksExtension !== false && tasksExtension !== null;
       state.eventsListChanged = typeof eventsExtension === "object" && eventsExtension !== null
         && (eventsExtension as JsonObject).listChanged === true;
+
+      state.tools = toolsCap !== undefined && toolsCap !== false && toolsCap !== null;
+      state.toolsListChanged = typeof toolsCap === "object" && toolsCap !== null
+        && (toolsCap as JsonObject).listChanged === true;
+
+      state.resources = resourcesCap !== undefined && resourcesCap !== false && resourcesCap !== null;
+      state.resourcesSubscribe = typeof resourcesCap === "object" && resourcesCap !== null
+        && (resourcesCap as JsonObject).subscribe === true;
+      state.resourcesListChanged = typeof resourcesCap === "object" && resourcesCap !== null
+        && (resourcesCap as JsonObject).listChanged === true;
+
+      state.prompts = promptsCap !== undefined && promptsCap !== false && promptsCap !== null;
+      state.promptsListChanged = typeof promptsCap === "object" && promptsCap !== null
+        && (promptsCap as JsonObject).listChanged === true;
+
+      state.completions = completionsCap !== undefined && completionsCap !== false && completionsCap !== null;
+
+      const hasSkillsExt = skillsExtension !== undefined && skillsExtension !== false && skillsExtension !== null;
+      state.skills = Boolean(state.resources && hasSkillsExt);
+      state.skillsDirectoryRead = Boolean(
+        state.skills
+          && typeof skillsExtension === "object"
+          && skillsExtension !== null
+          && (skillsExtension as JsonObject).directoryRead === true,
+      );
+
       state.serverInfo = result._meta?.[META_SERVER_INFO] as Implementation | undefined;
       state.instructions = result.instructions;
-      if (!state.events && !state.tasks) await classifyDormant("modern-dormant");
+      const hasAnyModernSurface =
+        state.events ||
+        state.tasks ||
+        state.skills ||
+        state.prompts ||
+        state.completions ||
+        state.tools ||
+        state.resources;
+      if (!hasAnyModernSurface) await classifyDormant("modern-dormant");
       else state.era = "modern";
       return state;
     } catch (error) {
@@ -548,18 +647,39 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
 
   function unionFilters(): ListenFilter {
     let eventsListChanged = false;
+    let toolsListChanged = false;
+    let promptsListChanged = false;
+    let resourcesListChanged = false;
     const taskIds: string[] = [];
-    const seen = new Set<string>();
+    const seenTasks = new Set<string>();
+    const resourceSubscriptions: string[] = [];
+    const seenResources = new Set<string>();
     for (const filter of owners.values()) {
       eventsListChanged ||= filter.eventsListChanged === true;
+      toolsListChanged ||= filter.toolsListChanged === true;
+      promptsListChanged ||= filter.promptsListChanged === true;
+      resourcesListChanged ||= filter.resourcesListChanged === true;
       for (const taskId of filter.taskIds ?? []) {
-        if (!seen.has(taskId)) {
-          seen.add(taskId);
+        if (!seenTasks.has(taskId)) {
+          seenTasks.add(taskId);
           taskIds.push(taskId);
         }
       }
+      for (const uri of filter.resourceSubscriptions ?? []) {
+        if (!seenResources.has(uri)) {
+          seenResources.add(uri);
+          resourceSubscriptions.push(uri);
+        }
+      }
     }
-    return normalizeFilter({ eventsListChanged, taskIds });
+    return normalizeFilter({
+      eventsListChanged,
+      taskIds,
+      toolsListChanged,
+      promptsListChanged,
+      resourcesListChanged,
+      resourceSubscriptions,
+    });
   }
 
   function setListenInterest(owner: ListenOwner, filter: ListenFilter): void {
@@ -612,6 +732,11 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     );
   }
 
+  async function park(): Promise<void> {
+    if (closed || desiredKey !== "{}" || active || pending) return;
+    await closeTransport().catch(() => {});
+  }
+
   function close(): Promise<void> {
     if (closePromise) return closePromise;
     closed = true;
@@ -644,6 +769,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       stateListeners.add(listener);
       return () => { stateListeners.delete(listener); };
     },
+    park,
     close,
   };
 }
