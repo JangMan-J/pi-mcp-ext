@@ -7,7 +7,7 @@ Stateless MCP `2026-07-28` events and asynchronous tasks for Pi, running alongsi
 Pi's `builtin:mcp` extension owns `/mcp`, synchronous `mcp__<server>__<tool>` tool exposure, resource tools, and `mcp-auth.json` sign-in and token refresh. `@jangmanj/pi-mcp-ext` loads in the same Pi session without replacing `builtin:mcp` and adds the `2026-07-28` protocol capabilities on configured `stdio` and Streamable HTTP servers:
 
 - **Stateless discovery and change streams**: probes enabled servers with `server/discover` (falling back cleanly when a server speaks an older MCP version) and maintains at most one `subscriptions/listen` stream per modern server when needed.
-- **Events (`io.modelcontextprotocol/events`)**: discovers event types via `events/list`, catches up with `events/poll`, streams live occurrences via `events/stream`, persists replay cursors in the session branch, deduplicates deliveries, and wakes Pi turns with `mcp-event` messages.
+- **Events (`io.modelcontextprotocol/events`)**: discovers event types via `events/list`, catches up with `events/poll`, streams live occurrences via `events/stream`, persists replay cursors in the session branch, deduplicates deliveries, and wakes Pi turns with `mcp-event` messages (`poll` and `push` delivery; `webhook`-only event types are skipped since a local CLI session has no inbound webhook endpoint).
 - **Tasks (`io.modelcontextprotocol/tasks`)**: invokes task-augmented MCP tools, tracks `working` and `input_required` tasks across `subscriptions/listen` push notifications and fallback `tasks/get` polling, supplies interactive input via `tasks/update`, cancels via `tasks/cancel`, and wakes Pi turns with `mcp-task` messages.
 - **Task-capability hint**: when a synchronous `mcp__<server>__<tool>` call fails with `-32021` naming `io.modelcontextprotocol/tasks` on a server that supports tasks, appends a hint showing the equivalent `mcp_tasks` call.
 - **Headless settle hold**: keeps `-p` and `--mode json` runs alive while non-terminal tasks or `holdSettle` event subscriptions are active, settling cleanly once deliveries drain.
@@ -36,6 +36,7 @@ Manage MCP `2026-07-28` event discovery, subscriptions, and polling.
 - `maxAgeMs?: number` — optional replay age limit in integer milliseconds.
 - `maxEvents?: number` — optional batch size limit for `action: "poll"`.
 - `holdSettle?: boolean` — keep headless (`-p` / `--mode json`) runs open until an event arrives or `unsubscribe` is called.
+- `logLevel?: "debug" | "info" | "notice" | "warning" | "error" | "critical" | "alert" | "emergency"` — per-request `SEP-2575` `io.modelcontextprotocol/logLevel` for `list` and `poll`; request-scoped `notifications/message` frames are appended to the tool result.
 
 ### `mcp_tasks`
 
@@ -47,6 +48,7 @@ Invoke and manage MCP `2026-07-28` task-augmented tool calls.
 - `arguments?: Record<string, unknown>` — tool arguments for `action: "call"`.
 - `taskId?: string` — task identifier for `get`, `update`, and `cancel`.
 - `inputResponses?: Record<string, unknown>` — responses keyed by `inputRequests` id for `action: "update"`.
+- `logLevel?: "debug" | "info" | "notice" | "warning" | "error" | "critical" | "alert" | "emergency"` — per-request `SEP-2575` `io.modelcontextprotocol/logLevel` for `call`, `get`, `update`, and `cancel`; request-scoped `notifications/message` frames are appended to the tool result.
 
 `action: "active"` reads the client's session task ledger directly without issuing a server RPC.
 

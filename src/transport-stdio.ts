@@ -24,6 +24,7 @@ import type {
 } from "./types.ts";
 
 const STDERR_TAIL_LIMIT = 2_000;
+const EOF_WAIT_MS = 150;
 const SHUTDOWN_WAIT_MS = 1_500;
 const SIGKILL_WAIT_MS = 500;
 const EXIT_DRAIN_MS = 50;
@@ -77,6 +78,7 @@ function waitOrTimeout(done: Promise<void>, ms: number): Promise<void> {
     const timer = setTimeout(() => {
       resolveWait();
     }, ms);
+    timer.unref?.();
     void done.then(() => {
       clearTimeout(timer);
       resolveWait();
@@ -141,10 +143,19 @@ export async function createStdioTransport(
   let exitDrainTimer: ReturnType<typeof setTimeout> | undefined;
   let closePromise: Promise<void> | undefined;
 
-  let resolveChildExited!: () => void;
+  const exitWaiters = new Set<() => void>();
+  let resolveChildExitedRaw!: () => void;
   const childExitedPromise = new Promise<void>((res) => {
-    resolveChildExited = res;
+    resolveChildExitedRaw = res;
   });
+  function resolveChildExited(): void {
+    resolveChildExitedRaw();
+    if (exitWaiters.size > 0) {
+      const waiters = [...exitWaiters];
+      exitWaiters.clear();
+      for (const waiter of waiters) waiter();
+    }
+  }
 
   function appendStderr(text: string): void {
     if (text.length === 0) return;
@@ -206,12 +217,18 @@ export async function createStdioTransport(
       const onExit = (): void => {
         if (settled) return;
         settled = true;
+        exitWaiters.delete(onExit);
         rejectWrite(new McpTransportError("closed", closedErrorMessage()));
       };
-      void childExitedPromise.then(onExit);
+      exitWaiters.add(onExit);
+      if (childExited) {
+        onExit();
+        return;
+      }
       child.stdin.write(frame, "utf8", (err) => {
         if (settled) return;
         settled = true;
+        exitWaiters.delete(onExit);
         if (err) {
           rejectWrite(new McpTransportError("closed", formatWithStderr(`MCP stdio write failed: ${err.message}`)));
           return;
@@ -289,6 +306,15 @@ export async function createStdioTransport(
         if (stream && !stream.settled) {
           stream.onNotification(msg);
         }
+        return;
+      }
+
+      if (msg.method === "notifications/message") {
+        let target: PendingRequest | undefined;
+        for (const entry of requests.values()) {
+          if (entry.onNotification) target = entry;
+        }
+        target?.onNotification?.(msg);
       }
     }
   }
@@ -429,6 +455,7 @@ export async function createStdioTransport(
         exitDrainTimer = setTimeout(() => {
           finalizeTermination();
         }, EXIT_DRAIN_MS);
+        exitDrainTimer.unref?.();
       }
     });
 
@@ -476,6 +503,7 @@ export async function createStdioTransport(
               void sendCancelled(msg.id, reason);
               rejectReq(new McpTransportError("timeout", formatWithStderr(reason)));
             }, timeoutMs);
+            entry.timer.unref?.();
           },
           resolve: resolveReq,
           reject: rejectReq,
@@ -619,7 +647,7 @@ export async function createStdioTransport(
           } catch {
             // Ignore stdin close errors.
           }
-          await waitOrTimeout(childExitedPromise, SHUTDOWN_WAIT_MS);
+          await waitOrTimeout(childExitedPromise, EOF_WAIT_MS);
         }
 
         if (!childExited) {

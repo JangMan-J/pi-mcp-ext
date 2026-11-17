@@ -160,30 +160,13 @@ export interface DiscoverResult {
   supportedVersions: string[];
   capabilities: ServerCapabilities;
   instructions?: string;
-  ttlMs?: number;
-  cacheScope?: "public" | "private";
   _meta?: { [META_SERVER_INFO]?: Implementation } & JsonObject;
 }
 
 /** Filter of `subscriptions/listen` and of its acknowledgment. False/empty fields are omitted on the wire. */
 export interface ListenFilter {
   eventsListChanged?: boolean;
-  toolsListChanged?: boolean;
-  promptsListChanged?: boolean;
-  resourcesListChanged?: boolean;
-  resourceSubscriptions?: string[];
   taskIds?: string[];
-}
-
-export interface ServerCard {
-  name?: string;
-  version?: string;
-  description?: string;
-  title?: string;
-  protocolVersions?: string[];
-  supportedProtocolVersions?: string[];
-  transports?: unknown;
-  [key: string]: unknown;
 }
 
 export type McpLogLevel =
@@ -215,8 +198,6 @@ export interface ListEventsResult {
   resultType: "complete";
   events: EventDescriptor[];
   nextCursor?: string;
-  ttlMs?: number;
-  cacheScope?: "public" | "private";
 }
 
 export interface EventOccurrence {
@@ -299,7 +280,6 @@ export interface CallToolResult {
 export interface InputRequiredResult {
   resultType: "input_required";
   inputRequests?: Record<string, ServerClientRequest>;
-  requestState?: string;
 }
 
 export type ToolCallOutcome = CallToolResult | InputRequiredResult | CreateTaskResult;
@@ -434,7 +414,12 @@ export interface ServerState {
   tasks: boolean;
   serverInfo?: Implementation;
   instructions?: string;
-  serverCard?: ServerCard;
+}
+
+export interface McpLogMessage {
+  level: McpLogLevel;
+  logger?: string;
+  data: unknown;
 }
 
 export interface ClientRequestOptions {
@@ -442,6 +427,7 @@ export interface ClientRequestOptions {
   /** Default: the server's timeoutMs. */
   timeoutMs?: number;
   onNotification?: (msg: JSONRPCNotification) => void;
+  onLog?: (entry: McpLogMessage) => void;
   /** HTTP only: extra headers (Mcp-Param-*). */
   headers?: Record<string, string>;
   /** SEP-2575 per-request log level (`io.modelcontextprotocol/logLevel`). */
@@ -468,10 +454,13 @@ export interface ServerClient {
     method: string,
     params: JsonObject,
     onNotification: (msg: JSONRPCNotification) => void,
-    opts?: { signal?: AbortSignal; headers?: Record<string, string> },
+    opts?: {
+      signal?: AbortSignal;
+      headers?: Record<string, string>;
+      logLevel?: McpLogLevel;
+      onLog?: (entry: McpLogMessage) => void;
+    },
   ): Promise<OpenStreamHandle>;
-  /** Fetch SEP-2127 Server Card for HTTP servers when available. */
-  discoverCard?(): Promise<ServerCard | undefined>;
   /**
    * Set one owner's share of the `subscriptions/listen` filter. The client unions all owners, holds at
    * most one stream, replaces it atomically when the union changes, and closes it when the union is empty.
@@ -575,18 +564,24 @@ export interface EventsEngineApi {
   restore(branch: readonly unknown[], allEntries: readonly unknown[]): void;
   /** A server became modern with events: (re)start its subscriptions. */
   serverReady(server: string): void;
-  list(server: string): Promise<EventDescriptor[]>;
+  list(server: string, opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void }): Promise<EventDescriptor[]>;
   subscribe(req: SubscribeRequest): Promise<SubscriptionRecord>;
   unsubscribe(server: string, name: string, args?: JsonObject): Promise<boolean>;
   subscriptions(): Array<SubscriptionRecord & { cursor: string | null; active: boolean; mode?: "push" | "poll" }>;
   /** One-shot `events/poll` without a subscription. */
-  poll(server: string, params: PollEventsParams): Promise<PollEventsResult>;
+  poll(
+    server: string,
+    params: PollEventsParams,
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
+  ): Promise<PollEventsResult>;
   /** Whether a subscription with holdSettle is active. */
   holdsSettle(): boolean;
   /** Count of open push streams (for the footer). */
   activeStreams(): number;
   /** Notifies after each wake (for settle hold). */
   onWake(listener: () => void): () => void;
+  /** Notifies when subscription/stream/hold state changes without requiring polling. */
+  onStateChange?(listener: () => void): () => void;
   /** Stop all streams/timers and flush dirty cursors. */
   shutdown(): Promise<void>;
 }
@@ -594,20 +589,35 @@ export interface EventsEngineApi {
 export interface TasksEngineApi {
   restore(allEntries: readonly unknown[]): void;
   serverReady(server: string): void;
-  /** `tools/call` with tasks and MRTR (`inputResponses` / `requestState`) support. */
+  /** `tools/call` with tasks in _meta; tracks a returned task. Returns the raw outcome. */
   call(
     server: string,
     tool: string,
     args?: JsonObject,
     signal?: AbortSignal,
-    mrtr?: { inputResponses?: JsonObject; requestState?: string },
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
   ): Promise<ToolCallOutcome>;
-  get(server: string, taskId: string): Promise<DetailedTask>;
-  update(server: string, taskId: string, inputResponses: JsonObject): Promise<void>;
-  cancel(server: string, taskId: string): Promise<void>;
+  get(
+    server: string,
+    taskId: string,
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
+  ): Promise<DetailedTask>;
+  update(
+    server: string,
+    taskId: string,
+    inputResponses: JsonObject,
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
+  ): Promise<void>;
+  cancel(
+    server: string,
+    taskId: string,
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
+  ): Promise<void>;
   active(): TaskRecord[];
   /** Whether any task is working or input_required. */
   hasPending(): boolean;
   onWake(listener: () => void): () => void;
+  /** Notifies when task state changes without requiring polling. */
+  onStateChange?(listener: () => void): () => void;
   shutdown(): Promise<void>;
 }

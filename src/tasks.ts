@@ -1,8 +1,11 @@
 import { CUSTOM_TASKS, MESSAGE_TASK, McpTransportError } from './types.ts';
-import type { TaskRecord, DetailedTask, EngineHost, TasksEngineApi, ServerClient, Task, JsonObject, ToolCallOutcome } from './types.ts';
+import type { TaskRecord, DetailedTask, EngineHost, TasksEngineApi, ServerClient, Task, JsonObject, ToolCallOutcome, McpLogLevel, McpLogMessage } from './types.ts';
 
+const MAX_TERMINAL_TASKS = 256;
 const terminal = (r: TaskRecord) => !['working', 'input_required'].includes(r.status);
 const key = (s: string, id: string) => JSON.stringify([s, id]);
+type LogOpts = { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void };
+const toReqOpts = (opts?: LogOpts) => opts?.logLevel || opts?.onLog ? { ...(opts.logLevel ? { logLevel: opts.logLevel } : {}), ...(opts.onLog ? { onLog: opts.onLog } : {}) } : undefined;
 function validate(value: unknown): asserts value is Task {
   const t = value as Task;
   if (!t || typeof t.taskId !== 'string' || !t.taskId || !['working','input_required','completed','failed','cancelled'].includes(t.status) || !Number.isFinite(Date.parse(t.createdAt)) || !Number.isFinite(Date.parse(t.lastUpdatedAt)) || !(t.ttlMs === null || (typeof t.ttlMs === 'number' && Number.isFinite(t.ttlMs) && t.ttlMs >= 0)) || (t.pollIntervalMs !== undefined && !(Number.isFinite(t.pollIntervalMs) && t.pollIntervalMs >= 0))) throw new McpTransportError('protocol', 'Invalid MCP Task');
@@ -24,12 +27,30 @@ export function createTasksEngine(host: EngineHost, opts: { pollFloorMs?: number
   const records = new Map<string, TaskRecord>();
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   const connections = new Map<string, { client: ServerClient; honored: Set<string>; off: (() => void)[] }>();
-  const busy = new Set<string>(), blocked = new Set<string>(), listeners = new Set<() => void>();
+  const busy = new Set<string>(), blocked = new Set<string>(), listeners = new Set<() => void>(), stateListeners = new Set<() => void>();
   const failures = new Map<string, number>();
   let closed = false;
+  const emitState = () => { for (const fn of [...stateListeners]) { try { fn(); } catch { /* ignore */ } } };
   const client = (s: string) => { const c = host.getClient(s); if (!c) throw new Error(`MCP server unavailable: ${s}`); return c; };
   const persist = (r: TaskRecord) => host.appendEntry(CUSTOM_TASKS, structuredClone(r));
   const clear = (r: TaskRecord) => { const k = key(r.server,r.taskId); clearTimeout(timers.get(k)); timers.delete(k); };
+  const cleanupTerminal = (r: TaskRecord) => {
+    const k = key(r.server, r.taskId);
+    failures.delete(k);
+    blocked.delete(k);
+    let termCount = 0;
+    for (const rec of records.values()) if (terminal(rec)) termCount++;
+    if (termCount > MAX_TERMINAL_TASKS) {
+      for (const [rk, rec] of records) {
+        if (terminal(rec)) {
+          records.delete(rk);
+          failures.delete(rk);
+          blocked.delete(rk);
+          if (--termCount <= MAX_TERMINAL_TASKS) break;
+        }
+      }
+    }
+  };
   const interest = (s: string) => connections.get(s)?.client.setListenInterest('tasks', { taskIds: [...records.values()].filter(r => r.server === s && !terminal(r)).map(r => r.taskId) });
   const wake = (r: TaskRecord, t?: DetailedTask, note?: string) => { host.wake(MESSAGE_TASK, formatTaskWake(r,t,note), structuredClone(r)); for (const fn of listeners) fn(); };
   const expireAt = (r: TaskRecord) => r.ttlMs === null ? Infinity : Date.parse(r.createdAt) + r.ttlMs;
@@ -41,9 +62,11 @@ export function createTasksEngine(host: EngineHost, opts: { pollFloorMs?: number
     const cadence = Math.max(r.pollIntervalMs ?? opts.defaultPollMs ?? 5000, opts.pollFloorMs ?? 1000) * (2 ** Math.min(failures.get(k) ?? 0, 6));
     const delay = Math.min(honored ? Infinity : immediate ? 0 : cadence, Math.max(0, expireAt(r) - Date.now() + 1));
     if (!Number.isFinite(delay)) return;
-    timers.set(k, setTimeout(() => { timers.delete(k); void poll(r); }, Math.min(delay, 2147483647)));
+    const t = setTimeout(() => { timers.delete(k); void poll(r); }, Math.min(delay, 2147483647));
+    (t as { unref?: () => void }).unref?.();
+    timers.set(k, t);
   }
-  function finish(r: TaskRecord, status: 'expired' | 'not_found_or_expired') { if (terminal(r)) return; r.status = status; persist(r); clear(r); interest(r.server); wake(r); }
+  function finish(r: TaskRecord, status: 'expired' | 'not_found_or_expired') { if (terminal(r)) return; r.status = status; persist(r); clear(r); cleanupTerminal(r); interest(r.server); wake(r); emitState(); }
   function apply(r: TaskRecord, raw: unknown) {
     validate(raw);
     const t = raw as DetailedTask & { resultType?: string };
@@ -63,10 +86,10 @@ export function createTasksEngine(host: EngineHost, opts: { pollFloorMs?: number
       }
     }
     persist(r);
-    if (terminal(r)) { clear(r); interest(r.server); if (!r.locallyCancelled) wake(r,t); }
-    else { if (note) wake(r,t,note); else if (!duplicate) host.log('info', `MCP task ${r.taskId}: ${r.status}`); schedule(r); }
+    if (terminal(r)) { clear(r); cleanupTerminal(r); interest(r.server); if (!r.locallyCancelled) wake(r,t); emitState(); }
+    else { if (note) wake(r,t,note); else if (!duplicate) host.log('info', `MCP task ${r.taskId}: ${r.status}`); if (!duplicate) emitState(); schedule(r); }
   }
-  async function fetchTask(r: TaskRecord) { const t = await client(r.server).request<DetailedTask>('tasks/get',{taskId:r.taskId}); if (!closed) apply(r,t); return t; }
+  async function fetchTask(r: TaskRecord, opts?: LogOpts) { const t = await client(r.server).request<DetailedTask>('tasks/get',{taskId:r.taskId},toReqOpts(opts)); if (!closed) apply(r,t); return t; }
   async function poll(r: TaskRecord) {
     const k = key(r.server,r.taskId); if (busy.has(k) || terminal(r) || closed) return;
     busy.add(k); const final = Date.now() > expireAt(r);
@@ -92,18 +115,19 @@ export function createTasksEngine(host: EngineHost, opts: { pollFloorMs?: number
     interest(s); for (const r of records.values()) if (r.server === s) schedule(r);
   }
   const requireRecord = (s: string,id: string) => { const r = records.get(key(s,id)); if (!r) throw new Error(`Unknown MCP task ${s}/${id}`); return r; };
-  const checked = async (s:string, method:string, params:JsonObject) => { const result = await client(s).request(method,params); if (result?.resultType === 'task') throw new McpTransportError('protocol','Task result on ineligible method'); return result; };
+  const checked = async (s:string, method:string, params:JsonObject, opts?: LogOpts) => { const result = await client(s).request(method,params,toReqOpts(opts)); if (result?.resultType === 'task') throw new McpTransportError('protocol','Task result on ineligible method'); return result; };
   const api: TasksEngineApi = {
-    restore(entries) { for (const value of entries) { const e = value as {type?:string;customType?:string;data?:TaskRecord}; if (e?.type === 'custom' && e.customType === CUSTOM_TASKS && e.data) { const r = e.data; try { validate({...r,status: terminal(r) ? 'completed' : r.status}); records.set(key(r.server,r.taskId),structuredClone(r)); } catch { host.log('warn','Invalid persisted MCP task'); } } } },
+    restore(entries) { for (const value of entries) { const e = value as {type?:string;customType?:string;data?:TaskRecord}; if (e?.type === 'custom' && e.customType === CUSTOM_TASKS && e.data) { const r = e.data; try { validate({...r,status: terminal(r) ? 'completed' : r.status}); const rec = structuredClone(r); records.set(key(r.server,r.taskId),rec); if (terminal(rec)) cleanupTerminal(rec); } catch { host.log('warn','Invalid persisted MCP task'); } } } emitState(); },
     serverReady:ready,
-    async call(s,tool,args,signal,mrtr) { const callParams:JsonObject = {name:tool,arguments:args}; if (mrtr?.inputResponses !== undefined) callParams.inputResponses = mrtr.inputResponses; if (mrtr?.requestState !== undefined) callParams.requestState = mrtr.requestState; const out = await client(s).request<ToolCallOutcome>('tools/call',callParams,{signal}); if (out.resultType === 'task') { validate(out); const r:TaskRecord = {server:s,toolName:tool,taskId:out.taskId,status:out.status,statusMessage:out.statusMessage,createdAt:out.createdAt,lastUpdatedAt:out.lastUpdatedAt,ttlMs:out.ttlMs,pollIntervalMs:out.pollIntervalMs,surfacedInputKeys:[],answeredInputKeys:[]}; records.set(key(s,r.taskId),r); persist(r); ready(s); } else if (out.resultType !== undefined && out.resultType !== 'complete' && out.resultType !== 'input_required') throw new McpTransportError('protocol','Unknown tools/call resultType'); return out; },
-    async get(s,id) { const r = requireRecord(s,id); try { return await fetchTask(r); } catch(e) { if ((e as {code?:number}).code === -32602) finish(r,'not_found_or_expired'); throw e; } },
-    async update(s,id,inputResponses) { const r = requireRecord(s,id); await checked(s,'tasks/update',{taskId:id,inputResponses}); r.answeredInputKeys = [...new Set([...r.answeredInputKeys,...Object.keys(inputResponses)])]; persist(r); },
-    async cancel(s,id) { const r = requireRecord(s,id); const request = checked(s,'tasks/cancel',{taskId:id}); r.locallyCancelled = true; r.status = 'cancelled'; r.surfacedInputKeys = []; r.answeredInputKeys = []; clear(r); persist(r); interest(s); await request; },
+    async call(s,tool,args,signal,opts) { const out = await client(s).request<ToolCallOutcome>('tools/call',{name:tool,arguments:args},{signal,...toReqOpts(opts)}); if (out.resultType === 'task') { validate(out); const r:TaskRecord = {server:s,toolName:tool,taskId:out.taskId,status:out.status,statusMessage:out.statusMessage,createdAt:out.createdAt,lastUpdatedAt:out.lastUpdatedAt,ttlMs:out.ttlMs,pollIntervalMs:out.pollIntervalMs,surfacedInputKeys:[],answeredInputKeys:[]}; records.set(key(s,r.taskId),r); persist(r); ready(s); emitState(); } else if (out.resultType !== undefined && out.resultType !== 'complete' && out.resultType !== 'input_required') throw new McpTransportError('protocol','Unknown tools/call resultType'); return out; },
+    async get(s,id,opts) { const r = requireRecord(s,id); try { return await fetchTask(r,opts); } catch(e) { if ((e as {code?:number}).code === -32602) finish(r,'not_found_or_expired'); throw e; } },
+    async update(s,id,inputResponses,opts) { const r = requireRecord(s,id); await checked(s,'tasks/update',{taskId:id,inputResponses},opts); r.answeredInputKeys = [...new Set([...r.answeredInputKeys,...Object.keys(inputResponses)])]; persist(r); },
+    async cancel(s,id,opts) { const r = requireRecord(s,id); const request = checked(s,'tasks/cancel',{taskId:id},opts); r.locallyCancelled = true; r.status = 'cancelled'; r.surfacedInputKeys = []; r.answeredInputKeys = []; clear(r); cleanupTerminal(r); persist(r); interest(s); emitState(); await request; },
     active:() => [...records.values()].map(r => structuredClone(r)),
     hasPending:() => [...records.values()].some(r => !terminal(r)),
     onWake(fn) { listeners.add(fn); return () => { listeners.delete(fn); }; },
-    async shutdown() { closed = true; for (const t of timers.values()) clearTimeout(t); timers.clear(); for (const c of connections.values()) { c.off.forEach(fn => fn()); c.client.setListenInterest('tasks',{}); } connections.clear(); host.signal.removeEventListener('abort',abort); },
+    onStateChange(fn) { stateListeners.add(fn); return () => { stateListeners.delete(fn); }; },
+    async shutdown() { closed = true; for (const t of timers.values()) clearTimeout(t); timers.clear(); for (const c of connections.values()) { c.off.forEach(fn => fn()); c.client.setListenInterest('tasks',{}); } connections.clear(); emitState(); host.signal.removeEventListener('abort',abort); },
   };
   const abort = () => { void api.shutdown(); }; host.signal.addEventListener('abort',abort,{once:true});
   return api;

@@ -1,3 +1,6 @@
+import { resolveConfigValue } from "./config.ts";
+import { collectXMcpHeaders, createHttpTransport, paramHeaders } from "./transport-http.ts";
+import { createStdioTransport } from "./transport-stdio.ts";
 import {
   CLIENT_INFO,
   ErrorCode,
@@ -27,10 +30,10 @@ import type {
   ListenOwner,
   Mcp2026Transport,
   McpLogLevel,
+  McpLogMessage,
   OpenStreamHandle,
   RequestId,
   ResolvedServer,
-  ServerCard,
   ServerClient,
   ServerState,
 } from "./types.ts";
@@ -84,11 +87,6 @@ function errorMessage(error: unknown): string {
 function normalizeFilter(filter: ListenFilter): ListenFilter {
   const normalized: ListenFilter = {};
   if (filter.eventsListChanged === true) normalized.eventsListChanged = true;
-  if (filter.toolsListChanged === true) normalized.toolsListChanged = true;
-  if (filter.promptsListChanged === true) normalized.promptsListChanged = true;
-  if (filter.resourcesListChanged === true) normalized.resourcesListChanged = true;
-  const resourceSubscriptions = [...new Set(filter.resourceSubscriptions ?? [])];
-  if (resourceSubscriptions.length) normalized.resourceSubscriptions = resourceSubscriptions;
   const taskIds = [...new Set(filter.taskIds ?? [])];
   if (taskIds.length) normalized.taskIds = taskIds;
   return normalized;
@@ -165,12 +163,9 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
   }
 
   async function defaultTransport(): Promise<Mcp2026Transport> {
-    const { resolveConfigValue } = await import("./config.ts");
     if (config.transport === "stdio") {
-      const { createStdioTransport } = await import("./transport-stdio.ts");
       return createStdioTransport(config, { cwd: deps.cwd, resolveValue: resolveConfigValue });
     }
-    const { createHttpTransport } = await import("./transport-http.ts");
     return createHttpTransport(config, {
       auth: deps.auth ?? noAuth,
       resolveValue: resolveConfigValue,
@@ -224,6 +219,50 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     await transport?.close();
   }
 
+  function forwardLogNotification(
+    msg: JSONRPCNotification,
+    onLog?: (entry: McpLogMessage) => void,
+  ): void {
+    if (msg.method !== "notifications/message") return;
+    const params = msg.params;
+    const rawLevel = typeof params?.level === "string" ? params.level : "info";
+    const mcpLevel: McpLogLevel = (
+      rawLevel === "debug"
+      || rawLevel === "info"
+      || rawLevel === "notice"
+      || rawLevel === "warning"
+      || rawLevel === "error"
+      || rawLevel === "critical"
+      || rawLevel === "alert"
+      || rawLevel === "emergency"
+    ) ? rawLevel : "info";
+    const level: "info" | "warn" | "error" = mcpLevel === "warning"
+      ? "warn"
+      : mcpLevel === "error" || mcpLevel === "critical" || mcpLevel === "alert" || mcpLevel === "emergency"
+        ? "error"
+        : "info";
+    const loggerName = typeof params?.logger === "string" && params.logger ? params.logger : undefined;
+    const logger = loggerName ? `/${loggerName}` : "";
+    const data = params?.data;
+    const text = typeof data === "string" ? data : JSON.stringify(data ?? params ?? {});
+    log(level, `[${config.name}${logger}] ${text}`);
+    onLog?.({
+      level: mcpLevel,
+      ...(loggerName ? { logger: loggerName } : {}),
+      data: data ?? params ?? {},
+    });
+  }
+
+  function wrapRequestNotifications(
+    userHandler?: (msg: JSONRPCNotification) => void,
+    onLog?: (entry: McpLogMessage) => void,
+  ): (msg: JSONRPCNotification) => void {
+    return (msg: JSONRPCNotification) => {
+      forwardLogNotification(msg, onLog);
+      userHandler?.(msg);
+    };
+  }
+
   async function rawRequest<T = JsonObject>(
     method: string,
     params?: JsonObject,
@@ -235,7 +274,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       {
         signal: opts?.signal,
         timeoutMs: opts?.timeoutMs ?? config.timeoutMs,
-        onNotification: opts?.onNotification,
+        onNotification: wrapRequestNotifications(opts?.onNotification, opts?.onLog),
         headers: opts?.headers,
       },
     );
@@ -244,22 +283,16 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
   }
 
   const toolHeaders = new Map<string, HeaderDescriptor[]>();
-  let toolHeadersExpiresAt = 0;
   let toolHeaderListing: Promise<void> | undefined;
 
-  async function cacheToolHeaders(force = false): Promise<void> {
-    if (!force && toolHeaderListing) return toolHeaderListing;
+  async function cacheToolHeaders(): Promise<void> {
+    if (toolHeaderListing) return toolHeaderListing;
     toolHeaderListing = (async () => {
-      const { collectXMcpHeaders } = await import("./transport-http.ts");
       toolHeaders.clear();
-      let minTtlMs: number | undefined;
       let cursor: string | undefined;
       const seen = new Set<string>();
       for (let page = 0; page < 32; page += 1) {
         const result = await rawRequest<JsonObject>("tools/list", cursor ? { cursor } : undefined);
-        if (typeof result.ttlMs === "number" && Number.isFinite(result.ttlMs) && result.ttlMs >= 0) {
-          minTtlMs = minTtlMs === undefined ? result.ttlMs : Math.min(minTtlMs, result.ttlMs);
-        }
         if (Array.isArray(result.tools)) {
           for (const tool of result.tools) {
             if (typeof tool !== "object" || tool === null) continue;
@@ -273,7 +306,6 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
         seen.add(result.nextCursor);
         cursor = result.nextCursor;
       }
-      toolHeadersExpiresAt = minTtlMs && minTtlMs > 0 ? Date.now() + minTtlMs : Infinity;
     })().finally(() => {
       toolHeaderListing = undefined;
     });
@@ -286,12 +318,8 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     supplied: Record<string, string> | undefined,
   ): Promise<Record<string, string> | undefined> {
     if (config.transport !== "http" || method !== "tools/call" || typeof params?.name !== "string") return supplied;
-    if (Date.now() >= toolHeadersExpiresAt && toolHeaders.size > 0) {
-      await cacheToolHeaders(true).catch(() => {});
-    }
     const descriptors = toolHeaders.get(params.name);
     if (!descriptors) return supplied;
-    const { paramHeaders } = await import("./transport-http.ts");
     const args = typeof params.arguments === "object" && params.arguments !== null ? params.arguments : {};
     return { ...supplied, ...paramHeaders(descriptors, args) };
   }
@@ -307,8 +335,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     } catch (error) {
       if (config.transport !== "http" || method !== "tools/call"
         || !(error instanceof McpRpcError) || error.code !== ErrorCode.HeaderMismatch) throw error;
-      await cacheToolHeaders(true);
-      const { paramHeaders } = await import("./transport-http.ts");
+      await cacheToolHeaders();
       const descriptors = typeof params?.name === "string" ? toolHeaders.get(params.name) ?? [] : [];
       const args = typeof params?.arguments === "object" && params.arguments !== null ? params.arguments : {};
       const retryHeaders = { ...opts?.headers, ...paramHeaders(descriptors, args) };
@@ -419,6 +446,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       reconnectTimer = undefined;
       if (!closed && desiredKey !== "{}" && !active && !pending) startAttempt(desired, desiredKey);
     }, jittered);
+    reconnectTimer.unref?.();
   }
 
   function cancelAttempt(attempt: ListenAttempt | undefined, reason: string): void {
@@ -479,10 +507,6 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       return;
     }
     if (msg.method === "notifications/subscriptions/acknowledged") return;
-    if (msg.method === "notifications/tools/list_changed") {
-      toolHeaders.clear();
-      toolHeadersExpiresAt = 0;
-    }
     for (const listener of [...notificationListeners]) listener(msg);
   }
 
@@ -524,24 +548,10 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
 
   function unionFilters(): ListenFilter {
     let eventsListChanged = false;
-    let toolsListChanged = false;
-    let promptsListChanged = false;
-    let resourcesListChanged = false;
-    const resourceSubscriptions: string[] = [];
-    const seenRes = new Set<string>();
     const taskIds: string[] = [];
     const seen = new Set<string>();
     for (const filter of owners.values()) {
       eventsListChanged ||= filter.eventsListChanged === true;
-      toolsListChanged ||= filter.toolsListChanged === true;
-      promptsListChanged ||= filter.promptsListChanged === true;
-      resourcesListChanged ||= filter.resourcesListChanged === true;
-      for (const uri of filter.resourceSubscriptions ?? []) {
-        if (!seenRes.has(uri)) {
-          seenRes.add(uri);
-          resourceSubscriptions.push(uri);
-        }
-      }
       for (const taskId of filter.taskIds ?? []) {
         if (!seen.has(taskId)) {
           seen.add(taskId);
@@ -549,14 +559,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
         }
       }
     }
-    return normalizeFilter({
-      eventsListChanged,
-      toolsListChanged,
-      promptsListChanged,
-      resourcesListChanged,
-      resourceSubscriptions,
-      taskIds,
-    });
+    return normalizeFilter({ eventsListChanged, taskIds });
   }
 
   function setListenInterest(owner: ListenOwner, filter: ListenFilter): void {
@@ -594,10 +597,19 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     method: string,
     params: JsonObject,
     onNotification: (msg: JSONRPCNotification) => void,
-    opts?: { signal?: AbortSignal; headers?: Record<string, string> },
+    opts?: {
+      signal?: AbortSignal;
+      headers?: Record<string, string>;
+      logLevel?: McpLogLevel;
+      onLog?: (entry: McpLogMessage) => void;
+    },
   ): Promise<OpenStreamHandle> {
     const transport = await getTransport();
-    return transport.openStream(requestMessage(method, params), onNotification, opts);
+    return transport.openStream(
+      requestMessage(method, params, nextId("request"), opts?.logLevel),
+      wrapRequestNotifications(onNotification, opts?.onLog),
+      opts,
+    );
   }
 
   function close(): Promise<void> {
@@ -616,36 +628,11 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
     return closePromise;
   }
 
-  async function discoverCard(): Promise<ServerCard | undefined> {
-    if (config.transport !== "http") return undefined;
-    const baseUrl = new URL(config.url);
-    const trimmedPath = baseUrl.pathname.replace(/\/+$/, "");
-    const candidates = [
-      new URL(`${trimmedPath}/server-card`, baseUrl.origin).toString(),
-      new URL("/.well-known/mcp/server-card.json", baseUrl.origin).toString(),
-    ];
-    for (const cardUrl of candidates) {
-      try {
-        const res = await fetch(cardUrl, { headers: { Accept: "application/json" } });
-        if (!res.ok) continue;
-        const parsed = (await res.json()) as unknown;
-        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-          state.serverCard = parsed as ServerCard;
-          return state.serverCard;
-        }
-      } catch {
-        // optional discovery path
-      }
-    }
-    return undefined;
-  }
-
   return {
     name: config.name,
     config,
     state,
     discover,
-    discoverCard,
     request,
     openStream,
     setListenInterest,

@@ -39,6 +39,8 @@ import {
   type EventDescriptor,
   type EventsEngineApi,
   type JsonObject,
+  type McpLogLevel,
+  type McpLogMessage,
   type PollEventsParams,
   type ProviderTokenLookup,
   type ResolvedServer,
@@ -49,7 +51,6 @@ import {
 } from "./types.ts";
 
 const STATUS_KEY = "mcp-ext";
-const SETTLE_POLL_MS = 250;
 
 interface DeclaredSubscriptionItem {
   name: string;
@@ -72,10 +73,12 @@ interface SessionRuntime {
   readonly tasks: TasksEngineApi;
   readonly configuredServers: Map<string, ConfiguredServerEntry>;
   readonly clients: Map<string, ServerClient>;
+  readonly clientCleanups: Map<string, () => void>;
   readonly probePromises: Map<string, Promise<void>>;
   readonly activationPromises: Map<string, Promise<void>>;
   readonly loggedWarnings: Set<string>;
   readonly wakeListeners: Set<() => void>;
+  readonly settleListeners: Set<() => void>;
   readonly cleanups: Array<() => void>;
   configLoadChain: Promise<void>;
   wakeCount: number;
@@ -139,6 +142,15 @@ const McpEventsParams = Type.Object(
           "Hold print/json settlement open until an event arrives or unsubscribe is called.",
       }),
     ),
+    logLevel: Type.Optional(
+      stringEnum(
+        ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"],
+        {
+          description:
+            "Per-request MCP log level (SEP-2575 io.modelcontextprotocol/logLevel) for list/poll.",
+        },
+      ),
+    ),
   },
   { additionalProperties: false },
 );
@@ -175,13 +187,17 @@ const McpTasksParams = Type.Object(
     ),
     inputResponses: Type.Optional(
       Type.Record(Type.String(), Type.Unknown(), {
-        description: "Responses keyed by inputRequests identifier (for action 'update' or MRTR retry on 'call').",
+        description: "Responses keyed by inputRequests identifier (for action 'update').",
       }),
     ),
-    requestState: Type.Optional(
-      Type.String({
-        description: "Opaque requestState token returned by an input_required response (for MRTR retry on 'call').",
-      }),
+    logLevel: Type.Optional(
+      stringEnum(
+        ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"],
+        {
+          description:
+            "Per-request MCP log level (SEP-2575 io.modelcontextprotocol/logLevel) for call/get/update/cancel.",
+        },
+      ),
     ),
   },
   { additionalProperties: false },
@@ -197,9 +213,39 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function jsonResult<T>(data: T): AgentToolResult<T> {
+function formatLogEntry(server: string, entry: McpLogMessage): string {
+  const logger = entry.logger ? `/${entry.logger}` : "";
+  const text = typeof entry.data === "string" ? entry.data : JSON.stringify(entry.data ?? {});
+  return `[${server}${logger}] (${entry.level}) ${text}`;
+}
+
+function createLogCollector(
+  server: string,
+  logLevel?: string,
+): {
+  opts?: { logLevel: McpLogLevel; onLog: (entry: McpLogMessage) => void };
+  logs: string[];
+} {
+  const logs: string[] = [];
+  if (!logLevel) return { logs };
   return {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+    logs,
+    opts: {
+      logLevel: logLevel as McpLogLevel,
+      onLog: (entry: McpLogMessage) => {
+        logs.push(formatLogEntry(server, entry));
+      },
+    },
+  };
+}
+
+function jsonResult<T>(data: T, logs?: readonly string[]): AgentToolResult<T> {
+  const content: TextContent[] = [{ type: "text", text: JSON.stringify(data, null, 2) }];
+  if (logs && logs.length > 0) {
+    content.push({ type: "text", text: logs.join("\n") });
+  }
+  return {
+    content,
     details: data,
   };
 }
@@ -227,7 +273,9 @@ function updateFooter(session: SessionRuntime | undefined, ctxOverride?: Extensi
     ctx.ui.setStatus(STATUS_KEY, undefined);
     return;
   }
-  const taskCount = session.tasks.active().length;
+  const taskCount = session.tasks
+    .active()
+    .filter((t) => t.status === "working" || t.status === "input_required").length;
   const streamCount = session.events.activeStreams();
   ctx.ui.setStatus(STATUS_KEY, formatFooterStatus(taskCount, streamCount));
 }
@@ -397,6 +445,36 @@ async function activateDeclaredSubscriptions(
   const supportsClientDelivery = (descriptor: EventDescriptor): boolean =>
     descriptor.delivery.includes("push") || descriptor.delivery.includes("poll");
 
+  const tasksToRun: Array<Promise<void>> = [];
+  const queueSub = (
+    name: string,
+    item: DeclaredSubscriptionItem,
+    delivery: DeliveryPreference,
+    holdSettle: boolean,
+  ): void => {
+    tasksToRun.push(
+      session.events
+        .subscribe({
+          server: serverName,
+          name,
+          ...(item.arguments !== undefined ? { arguments: item.arguments } : {}),
+          delivery,
+          cursor: undefined,
+          ...(item.maxAgeMs !== undefined ? { maxAgeMs: item.maxAgeMs } : {}),
+          holdSettle,
+        })
+        .then(() => undefined)
+        .catch((err) => {
+          if (!signal.aborted) {
+            session.host.log(
+              "warn",
+              `MCP server "${serverName}": failed to subscribe to "${name}": ${errorMessage(err)}`,
+            );
+          }
+        }),
+    );
+  };
+
   for (const item of declared) {
     if (signal.aborted) return;
     const delivery: DeliveryPreference = item.delivery ?? "auto";
@@ -406,24 +484,7 @@ async function activateDeclaredSubscriptions(
       for (const descriptor of descriptors) {
         if (signal.aborted) return;
         if (!supportsClientDelivery(descriptor)) continue;
-        try {
-          await session.events.subscribe({
-            server: serverName,
-            name: descriptor.name,
-            ...(item.arguments !== undefined ? { arguments: item.arguments } : {}),
-            delivery,
-            cursor: undefined,
-            ...(item.maxAgeMs !== undefined ? { maxAgeMs: item.maxAgeMs } : {}),
-            holdSettle,
-          });
-        } catch (err) {
-          if (!signal.aborted) {
-            session.host.log(
-              "warn",
-              `MCP server "${serverName}": failed to subscribe to "${descriptor.name}": ${errorMessage(err)}`,
-            );
-          }
-        }
+        queueSub(descriptor.name, item, delivery, holdSettle);
       }
       continue;
     }
@@ -445,25 +506,59 @@ async function activateDeclaredSubscriptions(
       continue;
     }
 
-    try {
-      await session.events.subscribe({
-        server: serverName,
-        name: item.name,
-        ...(item.arguments !== undefined ? { arguments: item.arguments } : {}),
-        delivery,
-        cursor: undefined,
-        ...(item.maxAgeMs !== undefined ? { maxAgeMs: item.maxAgeMs } : {}),
-        holdSettle,
-      });
-    } catch (err) {
-      if (!signal.aborted) {
-        session.host.log(
-          "warn",
-          `MCP server "${serverName}": failed to subscribe to "${item.name}": ${errorMessage(err)}`,
-        );
-      }
-    }
+    queueSub(item.name, item, delivery, holdSettle);
   }
+
+  if (tasksToRun.length > 0) {
+    await Promise.all(tasksToRun);
+  }
+}
+
+function serverTransportKey(server: ConfiguredServerEntry): string {
+  if (server.transport === "stdio") {
+    return JSON.stringify({
+      transport: "stdio",
+      enabled: server.enabled,
+      timeoutMs: server.timeoutMs,
+      command: server.command,
+      args: server.args,
+      env: Object.entries(server.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+      cwd: server.cwd ?? null,
+    });
+  }
+  return JSON.stringify({
+    transport: "http",
+    enabled: server.enabled,
+    timeoutMs: server.timeoutMs,
+    url: server.url,
+    headers: Object.entries(server.headers).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    authProvider: server.authProvider ?? null,
+  });
+}
+
+function scheduleDeclaredActivation(
+  session: SessionRuntime,
+  server: ConfiguredServerEntry,
+  client: ServerClient,
+  basePromise: Promise<void>,
+): void {
+  if (!server.subscribe || server.subscribe.length === 0) return;
+  const signal = session.controller.signal;
+  const declared = server.subscribe;
+  const activationPromise = basePromise
+    .then(async () => {
+      if (signal.aborted) return;
+      const state = client.state;
+      if (state.era !== "modern" || !state.events) return;
+      await activateDeclaredSubscriptions(session, server.name, declared);
+      updateFooter(session);
+    })
+    .finally(() => {
+      if (session.activationPromises.get(server.name) === activationPromise) {
+        session.activationPromises.delete(server.name);
+      }
+    });
+  session.activationPromises.set(server.name, activationPromise);
 }
 
 function startServerProbe(
@@ -496,31 +591,26 @@ function startServerProbe(
   })();
 
   session.probePromises.set(server.name, probePromise);
+  scheduleDeclaredActivation(session, server, client, probePromise);
+}
 
-  if (server.subscribe && server.subscribe.length > 0) {
-    const declared = server.subscribe;
-    const activationPromise = probePromise
-      .then(async () => {
-        if (signal.aborted) return;
-        const state = client.state;
-        if (state.era !== "modern" || !state.events) return;
-        await activateDeclaredSubscriptions(session, server.name, declared);
-        updateFooter(session);
-      })
-      .finally(() => {
-        if (session.activationPromises.get(server.name) === activationPromise) {
-          session.activationPromises.delete(server.name);
-        }
-      });
-    session.activationPromises.set(server.name, activationPromise);
+async function detachClient(session: SessionRuntime, name: string): Promise<void> {
+  session.clientCleanups.get(name)?.();
+  session.clientCleanups.delete(name);
+  session.probePromises.delete(name);
+  session.activationPromises.delete(name);
+  const client = session.clients.get(name);
+  session.clients.delete(name);
+  if (client) {
+    await client.close().catch(() => {});
   }
 }
 
-function attachConfiguredServers(
+async function reconcileConfiguredServers(
   session: SessionRuntime,
   servers: readonly ConfiguredServerEntry[],
   warnings: readonly ConfigWarning[],
-): void {
+): Promise<void> {
   if (session.controller.signal.aborted) return;
 
   for (const warning of warnings) {
@@ -530,6 +620,34 @@ function attachConfiguredServers(
       session.host.log("warn", formatted);
     }
   }
+
+  const nextByName = new Map<string, ConfiguredServerEntry>();
+  for (const server of servers) {
+    nextByName.set(server.name, server);
+  }
+
+  // Close and remove clients whose server was deleted, disabled, or reconfigured.
+  const detachTasks: Array<Promise<void>> = [];
+  for (const [name, oldCfg] of [...session.configuredServers.entries()]) {
+    const nextCfg = nextByName.get(name);
+    if (!nextCfg) {
+      session.configuredServers.delete(name);
+      if (session.clients.has(name)) {
+        detachTasks.push(detachClient(session, name));
+      }
+      continue;
+    }
+    if (
+      session.clients.has(name) &&
+      (!nextCfg.enabled || serverTransportKey(oldCfg) !== serverTransportKey(nextCfg))
+    ) {
+      detachTasks.push(detachClient(session, name));
+    }
+  }
+  if (detachTasks.length > 0) {
+    await Promise.allSettled(detachTasks);
+  }
+  if (session.controller.signal.aborted) return;
 
   const providerToken: ProviderTokenLookup = async (
     provider: string,
@@ -545,16 +663,23 @@ function attachConfiguredServers(
   };
 
   for (const server of servers) {
-    const existingConfig = session.configuredServers.get(server.name);
+    const prevCfg = session.configuredServers.get(server.name);
     session.configuredServers.set(server.name, server);
 
     if (!server.enabled) {
       continue;
     }
 
-    if (session.clients.has(server.name)) {
-      // Already connected/probing; keep existing client.
-      void existingConfig;
+    const existingClient = session.clients.get(server.name);
+    if (existingClient) {
+      if (
+        server.subscribe &&
+        server.subscribe.length > 0 &&
+        JSON.stringify(prevCfg?.subscribe ?? []) !== JSON.stringify(server.subscribe)
+      ) {
+        const probe = session.probePromises.get(server.name) ?? Promise.resolve();
+        scheduleDeclaredActivation(session, server, existingClient, probe);
+      }
       continue;
     }
 
@@ -573,7 +698,7 @@ function attachConfiguredServers(
     const offListen = client.onListenState(() => {
       updateFooter(session);
     });
-    session.cleanups.push(offListen);
+    session.clientCleanups.set(server.name, offListen);
 
     startServerProbe(session, server, client);
   }
@@ -588,21 +713,30 @@ function queueConfigReload(
     const loaded: { servers: ConfiguredServerEntry[]; warnings: ConfigWarning[] } =
       await loadServerConfigs(options);
     if (session.controller.signal.aborted) return;
-    attachConfiguredServers(session, loaded.servers, loaded.warnings);
+    await reconcileConfiguredServers(session, loaded.servers, loaded.warnings);
     updateFooter(session);
   });
   session.configLoadChain = next.catch(() => undefined);
   return next;
 }
 
+function notifySettleListeners(session: SessionRuntime | undefined): void {
+  if (!session) return;
+  for (const listener of [...session.settleListeners]) {
+    listener();
+  }
+}
+
 function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionRuntime {
   const controller = new AbortController();
   const configuredServers = new Map<string, ConfiguredServerEntry>();
   const clients = new Map<string, ServerClient>();
+  const clientCleanups = new Map<string, () => void>();
   const probePromises = new Map<string, Promise<void>>();
   const activationPromises = new Map<string, Promise<void>>();
   const loggedWarnings = new Set<string>();
   const wakeListeners = new Set<() => void>();
+  const settleListeners = new Set<() => void>();
   const cleanups: Array<() => void> = [];
 
   let runtimeRef: SessionRuntime | undefined;
@@ -642,9 +776,10 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
         },
       );
       updateFooter(runtimeRef);
-      for (const listener of wakeListeners) {
+      for (const listener of [...wakeListeners]) {
         listener();
       }
+      notifySettleListeners(runtimeRef);
     },
     log(level: "info" | "warn" | "error", message: string): void {
       updateFooter(runtimeRef);
@@ -671,10 +806,12 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
     tasks,
     configuredServers,
     clients,
+    clientCleanups,
     probePromises,
     activationPromises,
     loggedWarnings,
     wakeListeners,
+    settleListeners,
     cleanups,
     configLoadChain: Promise.resolve(),
     wakeCount: 0,
@@ -685,19 +822,37 @@ function createSessionRuntime(pi: ExtensionAPI, ctx: ExtensionContext): SessionR
   cleanups.push(
     events.onWake(() => {
       updateFooter(session);
-      for (const listener of wakeListeners) {
+      for (const listener of [...wakeListeners]) {
         listener();
       }
+      notifySettleListeners(session);
     }),
   );
   cleanups.push(
     tasks.onWake(() => {
       updateFooter(session);
-      for (const listener of wakeListeners) {
+      for (const listener of [...wakeListeners]) {
         listener();
       }
+      notifySettleListeners(session);
     }),
   );
+  if (events.onStateChange) {
+    cleanups.push(
+      events.onStateChange(() => {
+        updateFooter(session);
+        notifySettleListeners(session);
+      }),
+    );
+  }
+  if (tasks.onStateChange) {
+    cleanups.push(
+      tasks.onStateChange(() => {
+        updateFooter(session);
+        notifySettleListeners(session);
+      }),
+    );
+  }
 
   return session;
 }
@@ -726,6 +881,14 @@ function shutdownSession(
       uiCtx.ui.setStatus(STATUS_KEY, undefined);
     }
 
+    for (const off of session.clientCleanups.values()) {
+      try {
+        off();
+      } catch {
+        // Ignore listener cleanup errors.
+      }
+    }
+    session.clientCleanups.clear();
     const cleanups = session.cleanups.splice(0, session.cleanups.length);
     for (const cleanup of cleanups) {
       try {
@@ -735,6 +898,7 @@ function shutdownSession(
       }
     }
     session.wakeListeners.clear();
+    session.settleListeners.clear();
 
     await Promise.allSettled([session.events.shutdown(), session.tasks.shutdown()]);
     await Promise.allSettled(
@@ -1078,10 +1242,11 @@ export default function extension(pi: ExtensionAPI): void {
           }
           const session = requireActiveSession();
           await ensureModernCapability(session, params.server, "events", signal);
+          const collector = createLogCollector(params.server, params.logLevel);
           try {
-            const list = await session.events.list(params.server);
+            const list = await session.events.list(params.server, collector.opts);
             updateFooter(session, ctx);
-            return jsonResult(list);
+            return jsonResult(list, collector.logs);
           } catch (err) {
             throw normalizeServerCallError(params.server, err);
           }
@@ -1170,10 +1335,11 @@ export default function extension(pi: ExtensionAPI): void {
             ...(params.maxAgeMs !== undefined ? { maxAgeMs: params.maxAgeMs } : {}),
             ...(params.maxEvents !== undefined ? { maxEvents: params.maxEvents } : {}),
           };
+          const collector = createLogCollector(params.server, params.logLevel);
           try {
-            const result = await session.events.poll(params.server, pollParams);
+            const result = await session.events.poll(params.server, pollParams, collector.opts);
             updateFooter(session, ctx);
-            return jsonResult(result);
+            return jsonResult(result, collector.logs);
           } catch (err) {
             throw normalizeServerCallError(params.server, err);
           }
@@ -1223,31 +1389,17 @@ export default function extension(pi: ExtensionAPI): void {
           }
           const session = requireActiveSession();
           await ensureModernCapability(session, params.server, "tasks", signal);
+          const collector = createLogCollector(params.server, params.logLevel);
           try {
             const outcome = await session.tasks.call(
               params.server,
               params.tool,
               params.arguments,
               signal,
-              params.inputResponses !== undefined || params.requestState !== undefined
-                ? {
-                    ...(params.inputResponses !== undefined
-                      ? { inputResponses: params.inputResponses }
-                      : {}),
-                    ...(params.requestState !== undefined
-                      ? { requestState: params.requestState }
-                      : {}),
-                  }
-                : undefined,
+              collector.opts,
             );
             updateFooter(session, ctx);
-            if ("resultType" in outcome && outcome.resultType === "input_required") {
-              return jsonResult({
-                ...outcome,
-                mrtrHint: "Retry mcp_tasks action 'call' with inputResponses (and requestState if present).",
-              });
-            }
-            return jsonResult(outcome);
+            return jsonResult(outcome, collector.logs);
           } catch (err) {
             throw normalizeServerCallError(params.server, err);
           }
@@ -1262,10 +1414,11 @@ export default function extension(pi: ExtensionAPI): void {
           }
           const session = requireActiveSession();
           await ensureModernCapability(session, params.server, "tasks", signal);
+          const collector = createLogCollector(params.server, params.logLevel);
           try {
-            const task = await session.tasks.get(params.server, params.taskId);
+            const task = await session.tasks.get(params.server, params.taskId, collector.opts);
             updateFooter(session, ctx);
-            return jsonResult(task);
+            return jsonResult(task, collector.logs);
           } catch (err) {
             throw normalizeServerCallError(params.server, err);
           }
@@ -1285,14 +1438,23 @@ export default function extension(pi: ExtensionAPI): void {
           }
           const session = requireActiveSession();
           await ensureModernCapability(session, params.server, "tasks", signal);
+          const collector = createLogCollector(params.server, params.logLevel);
           try {
-            await session.tasks.update(params.server, params.taskId, params.inputResponses);
+            await session.tasks.update(
+              params.server,
+              params.taskId,
+              params.inputResponses,
+              collector.opts,
+            );
             updateFooter(session, ctx);
-            return jsonResult({
-              server: params.server,
-              taskId: params.taskId,
-              updated: true,
-            });
+            return jsonResult(
+              {
+                server: params.server,
+                taskId: params.taskId,
+                updated: true,
+              },
+              collector.logs,
+            );
           } catch (err) {
             throw normalizeServerCallError(params.server, err);
           }
@@ -1307,14 +1469,18 @@ export default function extension(pi: ExtensionAPI): void {
           }
           const session = requireActiveSession();
           await ensureModernCapability(session, params.server, "tasks", signal);
+          const collector = createLogCollector(params.server, params.logLevel);
           try {
-            await session.tasks.cancel(params.server, params.taskId);
+            await session.tasks.cancel(params.server, params.taskId, collector.opts);
             updateFooter(session, ctx);
-            return jsonResult({
-              server: params.server,
-              taskId: params.taskId,
-              cancelled: true,
-            });
+            return jsonResult(
+              {
+                server: params.server,
+                taskId: params.taskId,
+                cancelled: true,
+              },
+              collector.logs,
+            );
           } catch (err) {
             throw normalizeServerCallError(params.server, err);
           }
@@ -1495,25 +1661,42 @@ export default function extension(pi: ExtensionAPI): void {
 
       const outcome = await new Promise<"woke" | "drained" | "aborted">((resolve) => {
         let settled = false;
-        let pollTimer: ReturnType<typeof setInterval> | undefined;
         let offWake: (() => void) | undefined;
+        let offSettle: (() => void) | undefined;
         const abortCleanups: Array<() => void> = [];
 
         const finish = (reason: "woke" | "drained" | "aborted") => {
           if (settled) return;
           settled = true;
-          if (pollTimer !== undefined) {
-            clearInterval(pollTimer);
-          }
           offWake?.();
+          offSettle?.();
           for (const cleanup of abortCleanups) cleanup();
           resolve(reason);
+        };
+
+        const evaluate = () => {
+          if (session.controller.signal.aborted || ctx.signal?.aborted) {
+            finish("aborted");
+            return;
+          }
+          if (session.wakeCount !== startWakeCount || ctx.hasPendingMessages()) {
+            finish("woke");
+            return;
+          }
+          if (!isHolding()) {
+            finish("drained");
+          }
         };
 
         const onWake = () => finish("woke");
         session.wakeListeners.add(onWake);
         offWake = () => {
           session.wakeListeners.delete(onWake);
+        };
+
+        session.settleListeners.add(evaluate);
+        offSettle = () => {
+          session.settleListeners.delete(evaluate);
         };
 
         for (const sig of [session.controller.signal, ctx.signal]) {
@@ -1527,29 +1710,7 @@ export default function extension(pi: ExtensionAPI): void {
           abortCleanups.push(() => sig.removeEventListener("abort", onAbort));
         }
 
-        if (session.wakeCount !== startWakeCount || ctx.hasPendingMessages()) {
-          finish("woke");
-          return;
-        }
-        if (!isHolding()) {
-          finish("drained");
-          return;
-        }
-
-        pollTimer = setInterval(() => {
-          if (session.controller.signal.aborted || ctx.signal?.aborted) {
-            finish("aborted");
-            return;
-          }
-          if (session.wakeCount !== startWakeCount || ctx.hasPendingMessages()) {
-            finish("woke");
-            return;
-          }
-          if (!isHolding()) {
-            finish("drained");
-          }
-        }, SETTLE_POLL_MS);
-        pollTimer.unref?.();
+        evaluate();
       });
 
       if (outcome === "woke") {

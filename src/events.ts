@@ -25,6 +25,8 @@ import type {
   JSONRPCNotification,
   JsonObject,
   ListEventsResult,
+  McpLogLevel,
+  McpLogMessage,
   OpenStreamHandle,
   PollEventsParams,
   PollEventsResult,
@@ -151,18 +153,27 @@ export function createEventsEngine(
   const checkpointMs = opts?.checkpointMs ?? 30000;
 
   const subs = new Map<string, Sub>();
-  const descriptorCache = new Map<string, { events: EventDescriptor[]; expiresAt: number }>();
+  const descriptorCache = new Map<string, EventDescriptor[]>();
+  const inflightLists = new Map<string, Promise<EventDescriptor[]>>();
   /** Newest non-null cursor per subKey, from restored entries. */
   const persistedCursors = new Map<string, string>();
   /** Newest recentEventIds per subKey, from restored entries. */
   const persistedRecent = new Map<string, string[]>();
   const listenDisposers = new Map<string, () => void>();
   const wakeListeners = new Set<() => void>();
+  const stateListeners = new Set<() => void>();
   const pendingBatch = new Map<string, EventDelivery>();
   let batchTimer: ReturnType<typeof setTimeout> | undefined;
   let shutDown = false;
 
-  host.signal?.addEventListener?.("abort", () => void shutdown(), { once: true });
+  const onAbort = () => void shutdown();
+  host.signal?.addEventListener?.("abort", onAbort, { once: true });
+
+  function emitStateChange(): void {
+    for (const listener of [...stateListeners]) {
+      try { listener(); } catch { /* listener faults are not engine faults */ }
+    }
+  }
 
   // ---- wakes / batching -------------------------------------------------------
 
@@ -279,28 +290,50 @@ export function createEventsEngine(
     listenDisposers.set(server, dispose);
   }
 
-  async function list(server: string): Promise<EventDescriptor[]> {
-    const client = host.getClient(server);
-    if (!client) throw new Error(`Unknown or not-ready MCP server: ${server}`);
-    ensureListen(server, client);
+  async function fetchList(
+    server: string,
+    client: ServerClient,
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
+  ): Promise<EventDescriptor[]> {
     const events: EventDescriptor[] = [];
     const seenCursors = new Set<string>();
-    let minTtlMs: number | undefined;
     let cursor: string | undefined;
+    const reqOpts = opts?.logLevel || opts?.onLog
+      ? { ...(opts.logLevel ? { logLevel: opts.logLevel } : {}), ...(opts.onLog ? { onLog: opts.onLog } : {}) }
+      : undefined;
     for (let page = 0; page < 32; page++) {
-      const result = await client.request<ListEventsResult>("events/list", cursor ? { cursor } : {});
-      if (typeof result.ttlMs === "number" && Number.isFinite(result.ttlMs) && result.ttlMs >= 0) {
-        minTtlMs = minTtlMs === undefined ? result.ttlMs : Math.min(minTtlMs, result.ttlMs);
-      }
+      const result = await client.request<ListEventsResult>(
+        "events/list",
+        cursor ? { cursor } : {},
+        reqOpts,
+      );
       events.push(...(result.events ?? []));
       const next = result.nextCursor;
       if (!next || seenCursors.has(next)) break;
       seenCursors.add(next);
       cursor = next;
     }
-    const expiresAt = minTtlMs === undefined ? Infinity : minTtlMs > 0 ? Date.now() + minTtlMs : 0;
-    descriptorCache.set(server, { events, expiresAt });
+    descriptorCache.set(server, events);
     return events;
+  }
+
+  async function list(
+    server: string,
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
+  ): Promise<EventDescriptor[]> {
+    const client = host.getClient(server);
+    if (!client) throw new Error(`Unknown or not-ready MCP server: ${server}`);
+    ensureListen(server, client);
+    if (opts?.logLevel || opts?.onLog) {
+      return fetchList(server, client, opts);
+    }
+    const existing = inflightLists.get(server);
+    if (existing) return existing;
+    const pending = fetchList(server, client).finally(() => {
+      if (inflightLists.get(server) === pending) inflightLists.delete(server);
+    });
+    inflightLists.set(server, pending);
+    return pending;
   }
 
   function selectMode(sub: Sub, descriptor: EventDescriptor): "push" | "poll" {
@@ -445,6 +478,7 @@ export function createEventsEngine(
     } else {
       wakeNotice(sub, `event subscription terminated (${code}: ${message})`);
     }
+    emitStateChange();
   }
 
   function fallbackToPoll(sub: Sub, reason: string): void {
@@ -458,6 +492,7 @@ export function createEventsEngine(
     sub.streamGen++;
     clearWatchdog(sub);
     sub.stream = undefined;
+    emitStateChange();
     void pollCycle(sub, sub.generation).catch(err => host.log("warn", `events/poll fallback failed: ${errorMessageOf(err)}`));
   }
 
@@ -562,11 +597,13 @@ export function createEventsEngine(
     }
     sub.stream = handle;
     sub.backoffMs = 250;
+    emitStateChange();
     armWatchdog(sub, streamGen);
     void handle.done.then(
       () => {
         if (sub.streamGen !== streamGen || sub.stopped || shutDown) return;
         sub.stream = undefined;
+        emitStateChange();
         clearWatchdog(sub);
         persistCursor(sub); // stream close flush
         scheduleReconnect(sub); // ended without terminated: reconnect with backoff
@@ -574,6 +611,7 @@ export function createEventsEngine(
       (err: unknown) => {
         if (sub.streamGen !== streamGen || sub.stopped || shutDown) return;
         sub.stream = undefined;
+        emitStateChange();
         clearWatchdog(sub);
         if (errorCodeOf(err) === ErrorCode.Unsupported && errorDataOf(err)?.reason !== "schema_changed") {
           fallbackToPoll(sub, errorMessageOf(err));
@@ -619,11 +657,7 @@ export function createEventsEngine(
     sub.startPromise = (async () => {
       try {
         ensureListen(sub.record.server, client);
-        const cached = descriptorCache.get(sub.record.server);
-        const descriptors =
-          cached && Date.now() < cached.expiresAt
-            ? cached.events
-            : await list(sub.record.server);
+        const descriptors = descriptorCache.get(sub.record.server) ?? (await list(sub.record.server));
         const descriptor = descriptors.find(d => d.name === sub.record.name);
         if (!descriptor) {
           host.log("warn", `event "${sub.record.name}" not found in events/list for ${sub.record.server}; subscription not started`);
@@ -632,6 +666,7 @@ export function createEventsEngine(
         sub.descriptorDelivery = descriptor.delivery ?? [];
         sub.mode = selectMode(sub, descriptor); // throws UnsupportedDeliveryMode for webhook-only
         sub.started = true;
+        emitStateChange();
         if (sub.mode === "poll") await pollCycle(sub, sub.generation);
         else await openPush(sub);
       } finally {
@@ -653,6 +688,7 @@ export function createEventsEngine(
     if (sub.dirtyCursor) persistCursor(sub);
     const handle = sub.stream;
     sub.stream = undefined;
+    emitStateChange();
     if (handle) { try { await handle.cancel("stopped"); } catch { /* already gone */ } }
   }
 
@@ -728,9 +764,12 @@ export function createEventsEngine(
 
     const client = host.getClient(req.server);
     if (client) {
-      // Validate against the descriptor before recording anything.
-      const descriptors = await list(req.server);
-      const descriptor = descriptors.find(d => d.name === req.name);
+      // Validate against cached descriptor when present, otherwise refresh events/list.
+      let descriptor = descriptorCache.get(req.server)?.find(d => d.name === req.name);
+      if (!descriptor) {
+        const descriptors = await list(req.server);
+        descriptor = descriptors.find(d => d.name === req.name);
+      }
       if (!descriptor) throw new Error(`Unknown event "${req.name}" on server "${req.server}" (not in events/list)`);
       const probe: Sub = existing ?? newSub(
         { subKey, server: req.server, name: req.name, delivery: req.delivery ?? "auto", holdSettle: false },
@@ -782,13 +821,20 @@ export function createEventsEngine(
     const sub = subs.get(subKey);
     if (!sub) return false;
     subs.delete(subKey);
+    persistedCursors.delete(subKey);
+    persistedRecent.delete(subKey);
     await stopSub(sub);
     const entry: SubscriptionEntry = { op: "remove", subKey, server };
     host.appendEntry(CUSTOM_SUBSCRIPTIONS, entry);
+    emitStateChange();
     return true;
   }
 
-  async function poll(server: string, params: PollEventsParams): Promise<PollEventsResult> {
+  async function poll(
+    server: string,
+    params: PollEventsParams,
+    opts?: { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void },
+  ): Promise<PollEventsResult> {
     const client = host.getClient(server);
     if (!client) throw new Error(`Unknown or not-ready MCP server: ${server}`);
     ensureListen(server, client);
@@ -796,18 +842,24 @@ export function createEventsEngine(
     if (params.arguments !== undefined) wire.arguments = params.arguments;
     if (params.maxAgeMs !== undefined) wire.maxAgeMs = params.maxAgeMs;
     if (params.maxEvents !== undefined) wire.maxEvents = params.maxEvents;
-    const result = await client.request<PollEventsResult>("events/poll", wire);
+    const reqOpts = opts?.logLevel || opts?.onLog
+      ? { ...(opts.logLevel ? { logLevel: opts.logLevel } : {}), ...(opts.onLog ? { onLog: opts.onLog } : {}) }
+      : undefined;
+    const result = await client.request<PollEventsResult>("events/poll", wire, reqOpts);
     return { ...result, cursor: result.cursor ?? null };
   }
 
   async function shutdown(): Promise<void> {
     if (shutDown) return;
     shutDown = true;
+    host.signal?.removeEventListener?.("abort", onAbort);
     if (batchTimer) { clearTimeout(batchTimer); batchTimer = undefined; }
     flushBatch();
     for (const dispose of listenDisposers.values()) { try { dispose(); } catch { /* ignore */ } }
     listenDisposers.clear();
+    inflightLists.clear();
     await Promise.all([...subs.values()].map(sub => stopSub(sub))); // stopSub flushes dirty cursors
+    emitStateChange();
   }
 
   return {
@@ -829,6 +881,10 @@ export function createEventsEngine(
     onWake: (listener: () => void) => {
       wakeListeners.add(listener);
       return () => { wakeListeners.delete(listener); };
+    },
+    onStateChange: (listener: () => void) => {
+      stateListeners.add(listener);
+      return () => { stateListeners.delete(listener); };
     },
     shutdown,
   };
