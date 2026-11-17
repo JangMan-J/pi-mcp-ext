@@ -32,6 +32,7 @@ import {
   normalizeServerCallError,
   type McpSession,
 } from "./session.ts";
+import { frameMcpTag } from "./framing.ts";
 import {
   EXT_TASKS,
   MESSAGE_EVENT,
@@ -1301,18 +1302,11 @@ export default function extension(pi: ExtensionAPI): void {
                   : undefined,
               });
               return (logs) => {
-                const escAttr = (s: string) =>
-                  s
-                    .replace(/&/g, "&amp;")
-                    .replace(/</g, "&lt;")
-                    .replace(/>/g, "&gt;")
-                    .replace(/"/g, "&quot;")
-                    .replace(/'/g, "&#39;");
-                const escBody = loaded.content.replace(/<\/(mcp_[a-zA-Z0-9_]*)/gi, "<\\/$1");
-                const framed =
-                  `<mcp_skill server="${escAttr(loaded.server)}" uri="${escAttr(loaded.uri)}" name="${escAttr(loaded.name)}">\n` +
-                  `${escBody}\n` +
-                  `</mcp_skill>`;
+                const framed = frameMcpTag(
+                  "mcp_skill",
+                  { server: loaded.server, uri: loaded.uri, name: loaded.name },
+                  `\n${loaded.content}\n`,
+                );
                 const content: TextContent[] = [
                   {
                     type: "text",
