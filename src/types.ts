@@ -360,6 +360,11 @@ interface ResolvedServerBase {
   description?: string;
   exposure?: McpExposure;
   toolExposure?: Record<string, McpExposure>;
+  /**
+   * When `false`, this extension does not open a client. Absent or `true` means eligible.
+   * Not `enabled: false` — other features still see an enabled server.
+   */
+  ext?: boolean;
 }
 
 export interface ResolvedStdioServer extends ResolvedServerBase {

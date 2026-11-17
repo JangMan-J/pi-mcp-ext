@@ -14,7 +14,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { buildMeta, createServerClient } from "./client.ts";
-import { createAuthResolver, loadServerConfigs } from "./config.ts";
+import { createAuthResolver, loadServerConfigs, shouldConnect } from "./config.ts";
 import { runElicitationPrompt } from "./elicitation.ts";
 import { createEventsEngine } from "./events.ts";
 import { createPromptsEngine, type PromptsEngineApi } from "./prompts.ts";
@@ -42,6 +42,7 @@ import {
   type ProviderTokenLookup,
   type ResolvedServer,
   type ServerClient,
+  type ServerEra,
   type ServerState,
   type TasksEngineApi,
 } from "./types.ts";
@@ -186,6 +187,11 @@ function formatConfigWarning(warning: ConfigWarning): string {
   return `${scopePrefix}: ${warning.message}`;
 }
 
+/** Close the client after discover only when the server does not speak MCP 2026-07-28. */
+export function shouldKeepConnection(era: ServerEra): boolean {
+  return era !== "legacy" && era !== "unsupported-modern-version";
+}
+
 function disabledServerState(server: ConfiguredServerEntry): ServerState {
   return {
     name: server.name,
@@ -263,6 +269,8 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
   const controller = new AbortController();
   const configuredServers = new Map<string, ConfiguredServerEntry>();
   const clients = new Map<string, ServerClient>();
+  /** Probes that were closed because the server does not speak MCP 2026-07-28. Keyed by transport so a reload of the same config does not spawn again. */
+  const closedProbes = new Map<string, { key: string; state: ServerState }>();
   const clientCleanups = new Map<string, () => void>();
   const probePromises = new Map<string, Promise<void>>();
   const activationPromises = new Map<string, Promise<void>>();
@@ -409,13 +417,15 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
     }
 
     const client = clients.get(serverName);
-    if (!client) {
+    const state = client?.state ?? closedProbes.get(serverName)?.state;
+    if (!state) {
       throw new Error(`MCP server "${serverName}" has no active client.`);
     }
-
-    const state = client.state;
     switch (state.era) {
       case "modern": {
+        if (!client) {
+          throw new Error(`MCP server "${serverName}" has no active client.`);
+        }
         if (capability === "events" && !state.events) {
           throw new Error(
             `MCP server "${serverName}" does not advertise io.modelcontextprotocol/events.`,
@@ -603,6 +613,17 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
         const state = await client.discover();
         if (signal.aborted) return;
         updateFooter();
+        if (!shouldKeepConnection(state.era)) {
+          if (clients.get(server.name) === client) {
+            const key = serverTransportKey(server);
+            await detachClient(server.name);
+            const still = configuredServers.get(server.name);
+            if (still && shouldConnect(still) && serverTransportKey(still) === key) {
+              closedProbes.set(server.name, { key, state: { ...state } });
+            }
+          }
+          return;
+        }
         if (state.era !== "modern") return;
         if (state.events) {
           events.serverReady(server.name);
@@ -687,18 +708,16 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
     const detachTasks: Array<Promise<void>> = [];
     for (const [name, oldCfg] of [...configuredServers.entries()]) {
       const nextCfg = nextByName.get(name);
-      if (!nextCfg) {
+      if (!nextCfg || !shouldConnect(nextCfg)) {
         configuredServers.delete(name);
-        if (clients.has(name)) {
-          detachTasks.push(detachClient(name));
-        }
+        closedProbes.delete(name);
+        if (clients.has(name)) detachTasks.push(detachClient(name));
         continue;
       }
-      if (
-        clients.has(name) &&
-        (!nextCfg.enabled || serverTransportKey(oldCfg) !== serverTransportKey(nextCfg))
-      ) {
-        detachTasks.push(detachClient(name));
+      const keyChanged = serverTransportKey(oldCfg) !== serverTransportKey(nextCfg);
+      if (!nextCfg.enabled || keyChanged) {
+        closedProbes.delete(name);
+        if (clients.has(name)) detachTasks.push(detachClient(name));
       }
     }
     if (detachTasks.length > 0) {
@@ -720,11 +739,21 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
     };
 
     for (const server of servers) {
+      if (!shouldConnect(server)) continue;
+
       const prevCfg = configuredServers.get(server.name);
       configuredServers.set(server.name, server);
 
       if (!server.enabled) {
         continue;
+      }
+
+      if (clients.has(server.name)) {
+        closedProbes.delete(server.name);
+      } else {
+        const prior = closedProbes.get(server.name);
+        if (prior?.key === serverTransportKey(server)) continue;
+        closedProbes.delete(server.name);
       }
 
       const existingClient = clients.get(server.name);
@@ -954,7 +983,8 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
       const states: ServerState[] = [];
       for (const [name, cfg] of configuredServers) {
         const client = clients.get(name);
-        states.push(client ? { ...client.state } : disabledServerState(cfg));
+        const retired = closedProbes.get(name)?.state;
+        states.push(client ? { ...client.state } : retired ? { ...retired } : disabledServerState(cfg));
       }
       updateFooter(ctxArg);
       return states;

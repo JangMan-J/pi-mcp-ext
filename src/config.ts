@@ -96,6 +96,45 @@ export async function resolveConfigValueAsync(value: string, opts?: { bypassCach
   return run;
 }
 function record(v: unknown): v is Record<string, any> { return typeof v === "object" && v !== null && !Array.isArray(v); }
+
+/** Comma-separated server names: trim, drop empties. Unset or blank means no filter. */
+export function serverNameSet(value: string | undefined): Set<string> | undefined {
+  if (value === undefined) return undefined;
+  const names = value.split(",").map((part) => part.trim()).filter((part) => part.length > 0);
+  return names.length > 0 ? new Set(names) : undefined;
+}
+
+/**
+ * Whether this extension should open a client.
+ * `ext: false` wins over `PI_MCP_EXT_INCLUDE`. `PI_MCP_EXT_EXCLUDE` always skips.
+ * A non-empty include list skips names that are not listed. Unset env vars do not throw.
+ */
+export function shouldConnect(
+  server: { name: string; ext?: boolean },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (server.ext === false) return false;
+  const exclude = serverNameSet(env.PI_MCP_EXT_EXCLUDE);
+  if (exclude?.has(server.name)) return false;
+  const include = serverNameSet(env.PI_MCP_EXT_INCLUDE);
+  if (include && !include.has(server.name)) return false;
+  return true;
+}
+
+/** `ext` is read from the raw entry because validation strips unknown keys. */
+function rawExt(raw: unknown): boolean | undefined {
+  if (!record(raw) || !Object.prototype.hasOwnProperty.call(raw, "ext")) return undefined;
+  if (typeof raw.ext !== "boolean") return undefined;
+  return raw.ext;
+}
+function extIsInvalid(raw: unknown): boolean {
+  return record(raw) && Object.prototype.hasOwnProperty.call(raw, "ext") && typeof raw.ext !== "boolean";
+}
+function withoutExt(raw: Record<string, any>): Record<string, any> {
+  if (!Object.prototype.hasOwnProperty.call(raw, "ext")) return raw;
+  const { ext: _ext, ...rest } = raw;
+  return rest;
+}
 function subscriptions(value: unknown): DeclaredSubscription[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const result: DeclaredSubscription[] = [];
@@ -111,25 +150,27 @@ function subscriptions(value: unknown): DeclaredSubscription[] | undefined {
   return result;
 }
 export async function loadServerConfigs(opts: ConfigLoadOptions): Promise<{ servers: ConfiguredServer[]; warnings: ConfigWarning[] }> {
-  const entries = new Map<string, { config: Record<string, any>; scope: ConfigScope }>();
+  const entries = new Map<string, { config: Record<string, any>; scope: ConfigScope; ext?: boolean }>();
   const warnings: ConfigWarning[] = [];
   function add(name: string, raw: unknown, scope: ConfigScope) {
     const warn = (message: string) => warnings.push({ scope, server: name, message });
     if (scope === "session" && [...entries.keys()].some(n => mcpNamespace(n) === mcpNamespace(name))) return;
+    if (extIsInvalid(raw)) { warn("ext must be a boolean"); return; }
+    const ext = rawExt(raw);
     if (scope === "project" && record(raw) && raw.command === undefined && raw.url === undefined && raw.type === undefined) {
       const base = entries.get(name);
       if (!base) { warn("Partial override needs a global server"); return; }
-      if (Object.keys(raw).some(k => !["enabled", "exposure", "toolExposure"].includes(k))) { warn("An override can only set enabled, exposure, toolExposure"); return; }
-      const config = validateMcpServerConfig(name, { ...base.config, ...raw });
+      if (Object.keys(raw).some(k => !["enabled", "exposure", "toolExposure", "ext"].includes(k))) { warn("An override can only set enabled, exposure, toolExposure, ext"); return; }
+      const config = validateMcpServerConfig(name, { ...withoutExt(base.config), ...withoutExt(raw) });
       if (typeof config === "string") warn(config);
-      else entries.set(name, { ...base, config });
+      else entries.set(name, { ...base, config, ...(ext !== undefined ? { ext } : {}) });
       return;
     }
-    const config = validateMcpServerConfig(name, raw);
+    const config = validateMcpServerConfig(name, record(raw) ? withoutExt(raw) : raw);
     if (typeof config === "string") { warn(config); return; }
     if ([...entries.keys()].some(n => n !== name && mcpNamespace(n) === mcpNamespace(name))) { warn("Server namespace conflicts with an earlier entry"); return; }
     if (scope === "project" && "url" in config && config.auth) { warn("auth is only allowed in global or session scope"); return; }
-    entries.set(name, { config, scope });
+    entries.set(name, { config, scope, ...(ext !== undefined ? { ext } : {}) });
   }
   function file(path: string, scope: ConfigScope) {
     let parsed: unknown;
@@ -142,7 +183,7 @@ export async function loadServerConfigs(opts: ConfigLoadOptions): Promise<{ serv
   if (opts.isProjectTrusted) file(join(opts.cwd, CONFIG_DIR_NAME, "mcp.json"), "project");
   for (const s of opts.sessionServers) add(s.name, s.config, "session");
   const servers: ConfiguredServer[] = [];
-  for (const [name, { config: c, scope }] of entries) {
+  for (const [name, { config: c, scope, ext }] of entries) {
     const base = {
       name,
       namespace: mcpNamespace(name),
@@ -152,6 +193,7 @@ export async function loadServerConfigs(opts: ConfigLoadOptions): Promise<{ serv
       ...(typeof c.description === "string" ? { description: c.description } : {}),
       ...(typeof c.exposure === "string" ? { exposure: c.exposure as McpExposure } : {}),
       ...(record(c.toolExposure) ? { toolExposure: c.toolExposure as Record<string, McpExposure> } : {}),
+      ...(ext !== undefined ? { ext } : {}),
     };
     let server: ConfiguredServer;
     if (typeof c.url === "string" && c.type !== "stdio") {
