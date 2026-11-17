@@ -1,3 +1,4 @@
+import { backgroundTimer } from "./timer.ts";
 import { CUSTOM_TASKS, MESSAGE_TASK, McpTransportError } from './types.ts';
 import type { TaskRecord, DetailedTask, EngineHost, TasksEngineApi, ServerClient, Task, JsonObject, ToolCallOutcome, McpLogLevel, McpLogMessage } from './types.ts';
 
@@ -63,8 +64,7 @@ export function createTasksEngine(host: EngineHost, opts: { pollFloorMs?: number
     const delay = Math.min(!force && honored ? Infinity : immediate || force ? 0 : cadenceOf(r, k), Math.max(0, expireAt(r) - Date.now() + 1));
     if (!Number.isFinite(delay)) return;
     if (force) forced.add(k);
-    const t = setTimeout(() => { timers.delete(k); forced.delete(k); void poll(r); }, Math.min(delay, 2147483647));
-    (t as { unref?: () => void }).unref?.();
+    const t = backgroundTimer(setTimeout(() => { timers.delete(k); forced.delete(k); void poll(r); }, Math.min(delay, 2147483647)));
     timers.set(k, t);
   }
   function cadenceOf(r: TaskRecord, k: string) {

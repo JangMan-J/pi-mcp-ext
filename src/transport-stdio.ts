@@ -1,3 +1,4 @@
+import { backgroundTimer } from "./timer.ts";
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { homedir } from "node:os";
@@ -81,7 +82,7 @@ function waitOrTimeout(done: Promise<void>, ms: number): Promise<void> {
     const timer = setTimeout(() => {
       resolveWait();
     }, ms);
-    timer.unref?.();
+    backgroundTimer(timer);
     void done.then(() => {
       clearTimeout(timer);
       resolveWait();
@@ -486,7 +487,7 @@ export async function createStdioTransport(
         exitDrainTimer = setTimeout(() => {
           finalizeTermination();
         }, EXIT_DRAIN_MS);
-        exitDrainTimer.unref?.();
+        backgroundTimer(exitDrainTimer);
       }
     });
 
@@ -536,7 +537,7 @@ export async function createStdioTransport(
               void sendCancelled(msg.id, reason);
               rejectReq(new McpTransportError("timeout", formatWithStderr(reason)));
             }, timeoutMs);
-            entry.timer.unref?.();
+            backgroundTimer(entry.timer);
           },
           resolve: resolveReq,
           reject: rejectReq,

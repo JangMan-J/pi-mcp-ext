@@ -9,6 +9,7 @@
  * this module stands down completely.
  */
 
+import { backgroundTimer } from "./timer.ts";
 import { createHash } from "node:crypto";
 import type { TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -312,8 +313,7 @@ export function createToolsFallback(
     if (builtinOwnsServer(server.name, server.namespace)) return false;
     if (settleMs > 0) {
       await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, settleMs);
-        t.unref?.();
+        backgroundTimer(setTimeout(resolve, settleMs));
       });
     }
     if (shutDown || builtinOwnsServer(server.name, server.namespace)) return false;

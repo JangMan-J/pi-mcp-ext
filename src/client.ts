@@ -1,3 +1,4 @@
+import { backgroundTimer } from "./timer.ts";
 import { resolveConfigValueAsync } from "./config.ts";
 import { paginateMcp } from "./framing.ts";
 import { createHttpTransport, paramHeaders, validateXMcpHeaders } from "./transport-http.ts";
@@ -240,7 +241,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       idleParkTimer = undefined;
       void park();
     }, 250);
-    idleParkTimer.unref?.();
+    backgroundTimer(idleParkTimer);
   }
 
   function nextId(prefix: string): string {
@@ -681,7 +682,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
       reconnectTimer = undefined;
       if (!closed && !listenUnsupported && desiredKey !== "{}" && !active && !pending) startAttempt(desired, desiredKey);
     }, jittered);
-    reconnectTimer.unref?.();
+    backgroundTimer(reconnectTimer);
   }
 
   function clearAckTimer(attempt: ListenAttempt | undefined): void {
@@ -776,7 +777,7 @@ export function createServerClient(config: ResolvedServer, deps: ClientDeps): Se
         streamFinished(attempt, undefined);
       }
     }, listenAckTimeoutMs);
-    attempt.ackTimer.unref?.();
+    backgroundTimer(attempt.ackTimer);
     void (async () => {
       try {
         const transport = await getTransport();

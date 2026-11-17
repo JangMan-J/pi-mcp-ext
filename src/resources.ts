@@ -6,6 +6,7 @@
  * the shared per-server `subscriptions/listen` stream.
  */
 
+import { backgroundTimer } from "./timer.ts";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { convertMcpContentBlocks, frameMcpTag, paginateMcp } from "./framing.ts";
 import {
@@ -132,9 +133,7 @@ export function convertResourceContentsToBlocks(
 }
 
 function timer(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
-  const t = setTimeout(fn, Math.max(0, ms));
-  (t as { unref?: () => void }).unref?.();
-  return t;
+  return backgroundTimer(setTimeout(fn, Math.max(0, ms)));
 }
 
 export function createResourcesEngine(

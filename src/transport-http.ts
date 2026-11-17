@@ -1,3 +1,4 @@
+import { backgroundTimer } from "./timer.ts";
 import { McpTransportError, McpRpcError, PROTOCOL_VERSION } from './types.ts';
 import type { AuthResolver, ResolvedHttpServer, Mcp2026Transport, JSONRPCRequest, JSONRPCResponse, JSONRPCResultResponse, JSONRPCNotification, TransportRequestOptions } from './types.ts';
 
@@ -167,7 +168,7 @@ export function createHttpTransport(server: ResolvedHttpServer, opts: { auth: Au
     const controller = new AbortController(); active.add(controller);
     let timer: ReturnType<typeof setTimeout> | undefined, timedOut = false;
     const abort = () => controller.abort();
-    const reset = () => { clearTimeout(timer); if (!stream && options.timeoutMs !== undefined) { timer = setTimeout(()=>{timedOut=true;controller.abort();},options.timeoutMs); timer.unref?.(); } };
+    const reset = () => { clearTimeout(timer); if (!stream && options.timeoutMs !== undefined) { timer = backgroundTimer(setTimeout(()=>{timedOut=true;controller.abort();},options.timeoutMs)); } };
     options.signal?.addEventListener('abort',abort,{once:true}); if (options.signal?.aborted) abort(); reset();
     const cleanup = () => {clearTimeout(timer); active.delete(controller); options.signal?.removeEventListener('abort',abort);};
     const normalize = (e: unknown) => controller.signal.aborted ? fail(timedOut?'timeout':'aborted',timedOut?'MCP request timed out':'MCP request aborted') : e instanceof McpTransportError || e instanceof McpRpcError ? e : fail('network',String(e));

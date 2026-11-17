@@ -4,6 +4,7 @@
  * Depends only on EngineHost/ServerClient from types.ts.
  */
 
+import { backgroundTimer } from "./timer.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
 import { escapeMcpAttr, frameMcpTag, paginateMcp } from "./framing.ts";
 import { writePrivateTempFile } from "./temp-files.ts";
@@ -139,9 +140,7 @@ function errorMessageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 function timer(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
-  const t = setTimeout(fn, Math.max(0, ms));
-  (t as { unref?: () => void }).unref?.();
-  return t;
+  return backgroundTimer(setTimeout(fn, Math.max(0, ms)));
 }
 
 export function createEventsEngine(

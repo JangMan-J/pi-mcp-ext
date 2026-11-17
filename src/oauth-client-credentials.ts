@@ -7,6 +7,7 @@
  * Never writes or locks `mcp-auth.json`.
  */
 
+import { backgroundTimer } from "./timer.ts";
 import { createPrivateKey, createSign, randomUUID, sign as cryptoSign } from "node:crypto";
 import { PROTOCOL_VERSION } from "./types.ts";
 import type {
@@ -61,7 +62,7 @@ function withBoundedSignal(outer?: AbortSignal, timeoutMs = OAUTH_HTTP_TIMEOUT_M
   outer?.addEventListener("abort", onAbort, { once: true });
   if (outer?.aborted) controller.abort();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  timer.unref?.();
+  backgroundTimer(timer);
   return {
     signal: controller.signal,
     cleanup() {

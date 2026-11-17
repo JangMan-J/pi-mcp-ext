@@ -1,3 +1,4 @@
+import { backgroundTimer } from "./timer.ts";
 import { exec, execSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -190,7 +191,7 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
       signal?.removeEventListener("abort", onAbort);
       resolve();
     }, ms);
-    timer.unref?.();
+    backgroundTimer(timer);
     const onAbort = () => {
       clearTimeout(timer);
       resolve();
