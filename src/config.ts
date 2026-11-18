@@ -3,13 +3,203 @@ import { exec, execSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-// Resolve Pi's internal validator beside its public entry point.
-const { validateMcpServerConfig } = await import(new URL("./core/mcp-servers.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href) as {
-  validateMcpServerConfig(name: string, raw: unknown): string | Record<string, any>;
-};
+import { pathToFileURL } from "node:url";
+import { CONFIG_DIR_NAME, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { parseClientCredentialsConfig, createClientCredentialsResolver } from "./oauth-client-credentials.ts";
 import type { AuthResolver, ConfigLoadOptions, ConfigScope, ConfigWarning, McpExposure, ProviderTokenLookup, ResolvedHttpServer, ResolvedServer } from "./types.ts";
+
+export type McpServerConfigValidator = (name: string, raw: unknown) => string | Record<string, any>;
+
+const SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const MCP_EXPOSURES = ["codemode", "deferred", "direct", "hidden"] as const;
+const MCP_EXPOSURE_ALIASES: Record<string, string> = { "codemode-deferred": "codemode" };
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return record(value) && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isLoopbackRedirectUri(value: string): boolean {
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname) && url.search === "" && url.hash === "";
+}
+
+function isClientMetadataDocumentCallback(callbackUrl: string | undefined): boolean {
+  if (callbackUrl === undefined) return true;
+  const url = new URL(callbackUrl);
+  return url.hostname !== "[::1]" && url.pathname === "/callback";
+}
+
+function validateOAuthFallback(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (!record(value)) return "oauth must be an object";
+  if (value.clientId !== undefined && typeof value.clientId !== "string") return "oauth.clientId must be a string";
+  if (value.clientSecret !== undefined && typeof value.clientSecret !== "string") return "oauth.clientSecret must be a string";
+  const port = value.callbackPort;
+  if (port !== undefined && (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)) {
+    return "oauth.callbackPort must be a port number";
+  }
+  if (value.callbackUrl !== undefined) {
+    if (typeof value.callbackUrl !== "string" || !isLoopbackRedirectUri(value.callbackUrl)) {
+      return "oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment";
+    }
+    const urlPort = new URL(value.callbackUrl).port;
+    if (urlPort && port !== undefined && Number(urlPort) !== port) {
+      return "oauth.callbackUrl and oauth.callbackPort name different ports";
+    }
+  }
+  if (value.scope !== undefined && typeof value.scope !== "string") return "oauth.scope must be a string";
+  if (value.clientName !== undefined && (typeof value.clientName !== "string" || !value.clientName.trim())) {
+    return "oauth.clientName must be a non-empty string";
+  }
+  const registration = value.clientRegistration;
+  if (registration !== undefined && registration !== "auto" && registration !== "dcr") {
+    if (registration !== "cimd") return 'oauth.clientRegistration must be "auto", "dcr", or "cimd"';
+    if (value.clientId !== undefined || value.clientName !== undefined) {
+      return 'oauth.clientRegistration "cimd" cannot be combined with oauth.clientId or oauth.clientName';
+    }
+    if (!isClientMetadataDocumentCallback(typeof value.callbackUrl === "string" ? value.callbackUrl : undefined)) {
+      return 'oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback';
+    }
+  }
+  const metadataUrl = value.authServerMetadataUrl;
+  if (metadataUrl !== undefined) {
+    const url = typeof metadataUrl === "string" && URL.canParse(metadataUrl) ? new URL(metadataUrl) : undefined;
+    if (!url || !(url.protocol === "https:" || (url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname)))) {
+      return "oauth.authServerMetadataUrl must be an https URL, or http on localhost, 127.0.0.1, or [::1]";
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Fallback validator matching Pi's `validateMcpServerConfig` when Pi's internal
+ * `core/mcp-servers.js` is not available on disk (e.g. compiled Bun/SEA binaries).
+ */
+export function validateMcpServerConfigFallback(name: string, raw: unknown): string | Record<string, any> {
+  if (!SERVER_NAME_RE.test(name)) return `invalid server name "${name}" (use letters, digits, "_" and "-")`;
+  if (!record(raw)) return `server "${name}" must be an object`;
+
+  const resolved: Record<string, any> = { ...raw };
+  if (typeof resolved.exposure === "string" && resolved.exposure in MCP_EXPOSURE_ALIASES) {
+    resolved.exposure = MCP_EXPOSURE_ALIASES[resolved.exposure];
+  }
+  if (record(resolved.toolExposure)) {
+    resolved.toolExposure = Object.fromEntries(
+      Object.entries(resolved.toolExposure).map(([tool, entry]) => [
+        tool,
+        typeof entry === "string" && entry in MCP_EXPOSURE_ALIASES ? MCP_EXPOSURE_ALIASES[entry] : entry,
+      ]),
+    );
+  }
+
+  if (resolved.enabled !== undefined && typeof resolved.enabled !== "boolean") {
+    return `server "${name}": enabled must be a boolean`;
+  }
+  if (resolved.description !== undefined && typeof resolved.description !== "string") {
+    return `server "${name}": description must be a string`;
+  }
+  if (resolved.timeout !== undefined && (typeof resolved.timeout !== "number" || !(resolved.timeout > 0))) {
+    return `server "${name}": timeout must be a positive number of seconds`;
+  }
+
+  const { type, url, command } = resolved;
+  if (type === "sse") {
+    return `server "${name}": legacy SSE transport is not supported; use the streamable HTTP URL`;
+  }
+
+  let kind: "http" | "stdio" | undefined;
+  if (typeof url === "string" && (type === undefined || type === "http" || type === "streamable-http")) {
+    if (!URL.canParse(url) || !/^https?:$/.test(new URL(url).protocol)) {
+      return `server "${name}": url must be an http or https URL`;
+    }
+    if (resolved.headers !== undefined && !isStringRecord(resolved.headers)) {
+      return `server "${name}": headers must map names to strings`;
+    }
+    const oauthErr = validateOAuthFallback(resolved.oauth);
+    if (oauthErr) return `server "${name}": ${oauthErr}`;
+    kind = "http";
+  } else if (typeof command === "string" && (type === undefined || type === "stdio")) {
+    if (resolved.args !== undefined && !(Array.isArray(resolved.args) && resolved.args.every((arg: unknown) => typeof arg === "string"))) {
+      return `server "${name}": args must be an array of strings`;
+    }
+    if (resolved.env !== undefined && !isStringRecord(resolved.env)) {
+      return `server "${name}": env must map names to strings`;
+    }
+    if (resolved.cwd !== undefined && typeof resolved.cwd !== "string") {
+      return `server "${name}": cwd must be a string`;
+    }
+    kind = "stdio";
+  } else {
+    return `server "${name}" needs either "command" (stdio) or "url" (streamable HTTP)`;
+  }
+
+  const exposures = MCP_EXPOSURES.map((value) => `"${value}"`).join(", ");
+  if (resolved.exposure !== undefined && (typeof resolved.exposure !== "string" || !(MCP_EXPOSURES as readonly string[]).includes(resolved.exposure))) {
+    return `server "${name}": exposure must be one of ${exposures}`;
+  }
+  if (resolved.toolExposure !== undefined) {
+    if (!record(resolved.toolExposure)) {
+      return `server "${name}": toolExposure must map tool names to exposures`;
+    }
+    for (const [tool, value] of Object.entries(resolved.toolExposure)) {
+      if (typeof value !== "string" || !(MCP_EXPOSURES as readonly string[]).includes(value)) {
+        return `server "${name}": toolExposure "${tool}" must be one of ${exposures}`;
+      }
+    }
+  }
+
+  if (kind === "http" && resolved.auth !== undefined) {
+    if (!record(resolved.auth) || typeof resolved.auth.provider !== "string" || !resolved.auth.provider) {
+      return `server "${name}": auth.provider must be a provider name`;
+    }
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && !LOOPBACK_HOSTS.includes(parsed.hostname)) {
+      return `server "${name}": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]`;
+    }
+  }
+
+  return resolved;
+}
+
+/**
+ * Resolve Pi's internal validator via `getPackageDir()` (which works through Pi's
+ * jiti extension alias without requiring `@earendil-works/pi-coding-agent` in local
+ * `node_modules`), falling back to `validateMcpServerConfigFallback` when internal
+ * files are not present on disk (e.g. compiled Bun/SEA binaries).
+ */
+export async function resolveMcpServerValidator(packageDir?: string): Promise<McpServerConfigValidator> {
+  let root: string | undefined = packageDir;
+  if (!root) {
+    try {
+      root = getPackageDir();
+    } catch {
+      return validateMcpServerConfigFallback;
+    }
+  }
+  const candidates = [
+    join(root, "dist", "core", "mcp-servers.js"),
+    join(root, "src", "core", "mcp-servers.ts"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const mod = await import(pathToFileURL(candidate).href) as { validateMcpServerConfig?: unknown };
+      if (typeof mod.validateMcpServerConfig === "function") {
+        return mod.validateMcpServerConfig as McpServerConfigValidator;
+      }
+    } catch {
+      // Try next candidate or fall back.
+    }
+  }
+  return validateMcpServerConfigFallback;
+}
+
+let cachedValidatorPromise: Promise<McpServerConfigValidator> | undefined;
+function getMcpServerValidator(): Promise<McpServerConfigValidator> {
+  cachedValidatorPromise ??= resolveMcpServerValidator();
+  return cachedValidatorPromise;
+}
 
 export interface DeclaredSubscription {
   name: string;
@@ -150,6 +340,7 @@ function subscriptions(value: unknown): DeclaredSubscription[] | undefined {
   return result;
 }
 export async function loadServerConfigs(opts: ConfigLoadOptions): Promise<{ servers: ConfiguredServer[]; warnings: ConfigWarning[] }> {
+  const validateMcpServerConfig = await getMcpServerValidator();
   const entries = new Map<string, { config: Record<string, any>; scope: ConfigScope; ext?: boolean }>();
   const warnings: ConfigWarning[] = [];
   function add(name: string, raw: unknown, scope: ConfigScope) {

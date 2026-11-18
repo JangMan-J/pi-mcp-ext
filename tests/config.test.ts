@@ -4,7 +4,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { loadServerConfigs, resolveConfigValue, createAuthResolver } from "../src/config.ts";
+import {
+  loadServerConfigs,
+  resolveConfigValue,
+  createAuthResolver,
+  resolveMcpServerValidator,
+  validateMcpServerConfigFallback,
+} from "../src/config.ts";
 
 test("read-only configuration scopes, subscriptions, expansion and credential refresh", async () => {
   const root = mkdtempSync(join(tmpdir(), "mcp-config-"));
@@ -75,4 +81,43 @@ test("read-only configuration scopes, subscriptions, expansion and credential re
     delete process.env.MCP_CONFIG_TEST;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("resolveMcpServerValidator loads Pi validator via getPackageDir and falls back when absent", async () => {
+  const realValidator = await resolveMcpServerValidator();
+  assert.notEqual(realValidator, validateMcpServerConfigFallback);
+  assert.equal(typeof realValidator("ok", { command: "node" }), "object");
+
+  const fallbackValidator = await resolveMcpServerValidator(join(tmpdir(), "pi-nonexistent-package-dir"));
+  assert.equal(fallbackValidator, validateMcpServerConfigFallback);
+});
+
+test("validateMcpServerConfigFallback matches Pi validation rules", () => {
+  const okStdio = validateMcpServerConfigFallback("local_1", {
+    command: "node",
+    args: ["server.js"],
+    env: { FOO: "bar" },
+    cwd: ".",
+    exposure: "codemode-deferred",
+    toolExposure: { ping: "codemode-deferred", secret: "hidden" },
+  });
+  assert.equal(typeof okStdio, "object");
+  assert.equal((okStdio as Record<string, any>).exposure, "codemode");
+  assert.deepEqual((okStdio as Record<string, any>).toolExposure, { ping: "codemode", secret: "hidden" });
+
+  const okHttp = validateMcpServerConfigFallback("remote-1", {
+    url: "https://example.test/mcp",
+    headers: { Authorization: "Bearer token" },
+    auth: { provider: "openai" },
+    oauth: { clientRegistration: "cimd", callbackUrl: "http://127.0.0.1:4321/callback", callbackPort: 4321 },
+  });
+  assert.equal(typeof okHttp, "object");
+
+  assert.match(String(validateMcpServerConfigFallback("bad name", { command: "x" })), /invalid server name/);
+  assert.match(String(validateMcpServerConfigFallback("bad", { type: "sse", url: "https://example.test" })), /legacy SSE/);
+  assert.match(String(validateMcpServerConfigFallback("bad", { url: "http://example.test", auth: { provider: "p" } })), /https URL/);
+  assert.match(String(validateMcpServerConfigFallback("bad", { url: "https://example.test", oauth: { clientRegistration: "cimd", callbackUrl: "http://localhost:8080/other" } })), /\/callback/);
+  assert.match(String(validateMcpServerConfigFallback("bad", { command: "x", timeout: 0 })), /timeout/);
+  assert.match(String(validateMcpServerConfigFallback("bad", { command: "x", exposure: "unknown" })), /exposure/);
+  assert.match(String(validateMcpServerConfigFallback("bad", {})), /needs either/);
 });
