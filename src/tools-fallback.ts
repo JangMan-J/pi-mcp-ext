@@ -15,7 +15,13 @@
 
 import { createHash } from "node:crypto";
 import type { TextContent } from "@earendil-works/pi-ai";
-import type { AgentToolResult, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  Theme,
+  ToolDefinition,
+  ToolRenderResultOptions,
+} from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import { convertMcpContentBlocks, paginateMcp, type ConvertedContent } from "./framing.ts";
 import { validateXMcpHeaders } from "./transport-http.ts";
@@ -96,6 +102,54 @@ export function convertToolContentBlocks(
   rawBlocks: readonly unknown[],
 ): ConvertedContent {
   return convertMcpContentBlocks(serverName, rawBlocks, { truncate: "middle", tempPrefix: "mcp-tool" });
+}
+
+export function renderFallbackToolResult(
+  label: string,
+  result: AgentToolResult<unknown>,
+  options: ToolRenderResultOptions,
+  theme: Theme,
+) {
+  const blocks = Array.isArray(result.content) ? result.content : [];
+  const text = blocks
+    .filter((b): b is TextContent => b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n");
+  const rawLines = text.length > 0 ? text.split(/\r?\n/) : [];
+  const lineCount = rawLines.length;
+  const charCount = text.length;
+  const firstPreview = (rawLines.find((l) => l.trim().length > 0) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    invalidate(): void {},
+    render(width: number): string[] {
+      const w = Math.max(1, width);
+      if (!options.expanded) {
+        const meta = options.isPartial
+          ? `${label} (running...)`
+          : `${label} (${lineCount} lines, ${charCount} chars, ctrl+o to expand)`;
+        const full = firstPreview ? `${meta} — ${firstPreview}` : meta;
+        const clipped = full.length > w ? (w > 1 ? `${full.slice(0, w - 1)}…` : full.slice(0, w)) : full;
+        return [theme.fg("muted", clipped)];
+      }
+      if (rawLines.length === 0) {
+        return [theme.fg("muted", "(empty)")];
+      }
+      const out: string[] = [];
+      for (const line of rawLines) {
+        if (line.length <= w) {
+          out.push(line);
+        } else {
+          for (let i = 0; i < line.length; i += w) {
+            out.push(line.slice(i, i + w));
+          }
+        }
+      }
+      return out;
+    },
+  };
 }
 
 export function createToolsFallback(
@@ -229,6 +283,9 @@ export function createToolsFallback(
         exposure,
         namespace: namespaceObj,
         ...(tool.annotations ? { annotations: tool.annotations } : {}),
+        renderResult(result, options, theme) {
+          return renderFallbackToolResult(`${server.name}/${tool.name}`, result, options, theme);
+        },
         async execute(_toolCallId, params, signal): Promise<AgentToolResult<unknown>> {
           const liveClient = host.getClient(server.name);
           if (!liveClient) {
