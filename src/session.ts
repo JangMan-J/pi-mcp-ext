@@ -109,6 +109,11 @@ export interface McpSession {
   /** Restore engines from the active branch (and all entries for cursors/approvals), then refresh the footer. */
   restoreBranch(branch: readonly unknown[], allEntries: readonly unknown[], ctx?: ExtensionContext): void;
   /**
+   * Wait until pending config reload, probes, and declarative subscription activations settle
+   * (or `signal`/the session aborts).
+   */
+  ready(signal?: AbortSignal): Promise<void>;
+  /**
    * Current state of every configured server, once pending reload, probes, and declarative
    * subscription activations have settled (or `signal`/the session aborts). Refreshes the footer.
    */
@@ -974,6 +979,11 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
       resources.restore(branch);
       skills.restore(allEntries);
       updateFooter(ctxArg);
+    },
+
+    async ready(signal?: AbortSignal): Promise<void> {
+      await waitForReload(signal);
+      await waitForProbesAndActivations(signal);
     },
 
     async servers(signal?: AbortSignal, ctxArg?: ExtensionContext): Promise<ServerState[]> {

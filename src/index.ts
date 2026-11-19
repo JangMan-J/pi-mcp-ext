@@ -1375,6 +1375,10 @@ export default function extension(pi: ExtensionAPI): void {
     }, ctx);
   });
 
+  pi.on("before_agent_start", async (_event, ctx) => {
+    await activeSession()?.ready(ctx.signal);
+  });
+
   pi.on("session_tree", (_event, ctx) => {
     const session = activeSession();
     if (!session) return;
