@@ -43,7 +43,7 @@ function stripControlChars(raw: string): string {
   return raw.replace(ANSI_RE, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, "");
 }
 
-export function openExternalBrowser(url: string): void {
+export function openExternalBrowser(url: string): Promise<boolean> {
   const checked = inspectElicitationUrl(url);
   if (!checked.valid || !checked.href) {
     throw new Error(checked.error ?? "Refused to launch unsafe elicitation URL");
@@ -57,14 +57,17 @@ export function openExternalBrowser(url: string): void {
         : "xdg-open";
   const args =
     process.platform === "win32" ? ["url.dll,FileProtocolHandler", safeUrl] : [safeUrl];
-  const child = spawn(cmd, args, {
-    shell: false,
-    stdio: "ignore",
-    detached: true,
-    windowsHide: true,
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      shell: false,
+      stdio: "ignore",
+      detached: true,
+      windowsHide: true,
+    });
+    child.once("spawn", () => resolve(true));
+    child.on("error", () => resolve(false));
+    child.unref();
   });
-  child.on("error", () => {});
-  child.unref();
 }
 
 export function inspectElicitationUrl(rawUrl: unknown): {
@@ -376,7 +379,7 @@ export async function runElicitationPrompt(
   ui: ElicitationUi,
   serverName: string,
   rawParams: JsonObject,
-  opts?: { openUrl?: (url: string) => void },
+  opts?: { openUrl?: (url: string) => unknown },
 ): Promise<ElicitationResponse> {
   const mode = rawParams.mode === undefined ? "form" : rawParams.mode;
   const rawMessage = typeof rawParams.message === "string" ? rawParams.message : "Additional information requested.";
@@ -402,7 +405,9 @@ export async function runElicitationPrompt(
     const cancelLabel = "Cancel";
     const choice = await ui.select(promptTitle, [acceptLabel, declineLabel, cancelLabel]);
     if (choice === acceptLabel) {
-      (opts?.openUrl ?? openExternalBrowser)(inspected.href);
+      if ((await (opts?.openUrl ?? openExternalBrowser)(inspected.href)) === false) {
+        ui.notify(`Could not open a browser. Open this URL yourself: ${inspected.href}`, "warning");
+      }
       return { action: "accept" };
     }
     if (choice === declineLabel) return { action: "decline" };

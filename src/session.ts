@@ -649,13 +649,18 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
             }
           });
         }
+        const skillsListing = state.skills ? skills.serverReady(server.name) : undefined;
         let tookToolsFallback = false;
         if (state.tools) {
           tookToolsFallback = await toolsFallback.activateIfUnowned(server);
         }
         // Park idle stdio transport whenever no standing stream/listen interest is active;
         // client.park() checks desiredKey === "{}", inFlightCount === 0, and openUserStreams === 0.
-        if (!tookToolsFallback) {
+        if (!tookToolsFallback && skillsListing) {
+          void skillsListing.then(() => {
+            if (!signal.aborted && clients.get(server.name) === client) return client.park?.();
+          });
+        } else if (!tookToolsFallback) {
           await client.park?.();
         }
         updateFooter();
@@ -679,6 +684,7 @@ export function createMcpSession(pi: ExtensionAPI, ctx: ExtensionContext): McpSe
     tasks.serverRemoved?.(name);
     resources.serverRemoved?.(name);
     prompts.serverRemoved?.(name);
+    skills.serverRemoved(name);
     clientCleanups.get(name)?.();
     clientCleanups.delete(name);
     probePromises.delete(name);

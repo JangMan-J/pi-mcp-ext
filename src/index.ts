@@ -34,6 +34,7 @@ import {
   type McpSession,
 } from "./session.ts";
 import { frameMcpTag } from "./framing.ts";
+import { formatSkillsPromptSection, type LoadedSkillResult, type SkillEntry } from "./skills.ts";
 import {
   EXT_TASKS,
   MESSAGE_EVENT,
@@ -578,9 +579,25 @@ function createExpandableJsonRenderer(
 // Extension entry
 // ---------------------------------------------------------------------------------------------
 
+const SKILL_REFRESH_WAIT_MS = 2_000;
+
+function skillCommandMessage(loaded: LoadedSkillResult, args: string): string {
+  const framed = frameMcpTag(
+    "mcp_skill",
+    { server: loaded.server, uri: loaded.uri, name: loaded.name },
+    `\n${loaded.content}\n`,
+  );
+  const files =
+    loaded.supportingUris.length > 0
+      ? `\n\nRead its supporting files with the mcp_skills tool (action "read_file", server "${loaded.server}", uri "${loaded.uri}", path relative to the skill).`
+      : "";
+  return `${framed}${files}${args ? `\n\n${args}` : ""}`;
+}
+
 export default function extension(pi: ExtensionAPI): void {
   let currentSession: McpSession | undefined;
   const registeredPromptCommandNames = new Set<string>();
+  const registeredSkillCommandNames = new Set<string>();
 
   function activeSession(): McpSession | undefined {
     return currentSession && !currentSession.signal.aborted ? currentSession : undefined;
@@ -668,6 +685,41 @@ export default function extension(pi: ExtensionAPI): void {
       handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
         try {
           await executeSlashPrompt(serverName, prompt.name, args, ctx);
+        } catch (err) {
+          if (ctx.hasUI) ctx.ui.notify(errorMessage(err), "error");
+          else throw err;
+        }
+      },
+    });
+  }
+
+  async function executeSkillCommand(
+    serverName: string,
+    skillName: string,
+    rawArgs: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    const session = requireActiveSession();
+    await session.withServer({ server: serverName, capability: "skills", ctx }, async () => {
+      const skill = session.skills
+        .listed()
+        .find((l) => l.server === serverName)
+        ?.skills.find((s) => s.frontmatter.name === skillName);
+      if (!skill) throw new Error(`MCP server "${serverName}" no longer offers skill "${skillName}".`);
+      const loaded = await session.skills.load(serverName, skill.uri, { approve: async () => true });
+      pi.sendUserMessage(skillCommandMessage(loaded, rawArgs.trim()));
+    });
+  }
+
+  function ensureSkillCommand(serverName: string, skill: SkillEntry): void {
+    const cmdName = `mcp-skill:${serverName}:${skill.frontmatter.name}`;
+    if (registeredSkillCommandNames.has(cmdName)) return;
+    registeredSkillCommandNames.add(cmdName);
+    pi.registerCommand(cmdName, {
+      description: skill.frontmatter.description,
+      handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+        try {
+          await executeSkillCommand(serverName, skill.frontmatter.name, args, ctx);
         } catch (err) {
           if (ctx.hasUI) ctx.ui.notify(errorMessage(err), "error");
           else throw err;
@@ -1354,6 +1406,11 @@ export default function extension(pi: ExtensionAPI): void {
         ensurePerPromptCommand(serverName, prompt);
       }
     });
+    session.skills.onSkillsListed((serverName, skills) => {
+      for (const skill of skills) {
+        ensureSkillCommand(serverName, skill);
+      }
+    });
 
     session.restoreBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries(), ctx);
 
@@ -1375,8 +1432,14 @@ export default function extension(pi: ExtensionAPI): void {
     }, ctx);
   });
 
-  pi.on("before_agent_start", async (_event, ctx) => {
-    await activeSession()?.ready(ctx.signal);
+  pi.on("before_agent_start", async (event, ctx) => {
+    const session = activeSession();
+    if (!session) return;
+    await session.ready(ctx.signal);
+    await session.skills.refreshStale(SKILL_REFRESH_WAIT_MS);
+    const section = formatSkillsPromptSection(session.skills.listed());
+    if (section) event.systemPromptOptions.sections.mcp_skills = section;
+    else delete event.systemPromptOptions.sections.mcp_skills;
   });
 
   pi.on("session_tree", (_event, ctx) => {

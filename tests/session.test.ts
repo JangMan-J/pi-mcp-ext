@@ -29,6 +29,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       params: { level: logLevel, logger: "trace", data: "handled " + req.method },
     });
   }
+  const skillsDelay = process.env.FIXTURE_SKILLS_DELAY_MS;
   if (req.method === "server/discover") {
     send({
       jsonrpc: "2.0",
@@ -36,9 +37,21 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       result: {
         resultType: "complete",
         supportedVersions: ["2026-07-28"],
-        capabilities: { resources: {} },
+        capabilities: skillsDelay
+          ? { resources: {}, extensions: { "io.modelcontextprotocol/skills": {} } }
+          : { resources: {} },
+        ...(skillsDelay ? { instructions: "pid " + process.pid } : {}),
       },
     });
+    return;
+  }
+  if (req.method === "skills/list") {
+    const skill = {
+      uri: "skill://slow/SKILL.md",
+      frontmatter: { name: "slow", description: "pid " + process.pid },
+      resources: "dynamic",
+    };
+    setTimeout(() => send({ jsonrpc: "2.0", id: req.id, result: { resultType: "complete", skills: [skill], ttlMs: 60000 } }), Number(skillsDelay));
     return;
   }
   if (req.method === "resources/list") {
@@ -244,6 +257,39 @@ test("createMcpSession: reconcile, servers, withServer (logs, rejections, needs-
     assert.equal(session.signal.aborted, true);
     await assert.rejects(session.withServer({ server: "off" }, fn));
     assert.equal(calls, 0);
+  } finally {
+    await session?.shutdown();
+    h.restoreEnv();
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test("createMcpSession: a slow first skills listing does not hold ready(), and the idle stdio server parks once it settles", async () => {
+  const h = setup("session-skills-");
+  let session: McpSession | undefined;
+  try {
+    h.writeConfig({ slow: { env: { FIXTURE_PID_FILE: h.pidFile, FIXTURE_SKILLS_DELAY_MS: "1500" } } });
+    session = createMcpSession(h.pi, h.ctx);
+    const started = Date.now();
+    await session.reconcile(h.loadOptions());
+    await session.ready();
+    assert.ok(Date.now() - started < 1_000, "the first listing runs in the background");
+    assert.deepEqual(
+      session.skills.listed().map((l) => [l.server, l.skills.length]),
+      [["slow", 0]],
+    );
+    const pid = Number(readFileSync(h.pidFile, "utf8").trim());
+    for (let i = 0; i < 120 && session.skills.listed()[0]?.skills.length !== 1; i += 1) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(session.skills.listed()[0]?.skills.length, 1);
+    const [state] = await session.servers();
+    assert.equal(
+      session.skills.listed()[0].skills[0].frontmatter.description,
+      state.instructions,
+      "discovery and the first listing use the same process",
+    );
+    assert.equal(await waitForDeath(pid), true, "the idle stdio server parks after the listing");
   } finally {
     await session?.shutdown();
     h.restoreEnv();
