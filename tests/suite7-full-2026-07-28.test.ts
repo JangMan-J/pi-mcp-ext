@@ -10,7 +10,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildMeta, createServerClient, extractTraceMeta } from "../src/client.ts";
 import { createAuthResolver } from "../src/config.ts";
-import { inspectElicitationUrl, runElicitationPrompt, type ElicitationUi } from "../src/elicitation.ts";
+import {
+  inspectElicitationUrl,
+  openExternalBrowser,
+  runElicitationPrompt,
+  type ElicitationUi,
+} from "../src/elicitation.ts";
 import { parseClientCredentialsConfig } from "../src/oauth-client-credentials.ts";
 import {
   EXT_OAUTH_CLIENT_CREDENTIALS,
@@ -304,6 +309,25 @@ test("3. Interactive Elicitation: form mode (edit/review, enum/multi-enum, URL n
   assert.deepEqual(openedUrls, ["https://xn--80ak6aa92e.com/oauth/start"]);
   assert.match(selectPrompts[0], /MCP server "billing-mcp"/);
   assert.match(selectPrompts[0], /Punycode/);
+
+  const notices: string[] = [];
+  const unopened = await runElicitationPrompt(
+    { ...urlUi, notify: (message) => notices.push(message) },
+    "billing-mcp",
+    { mode: "url", url: "https://billing.example.com/connect", message: "Connect billing" },
+    { openUrl: () => false },
+  );
+  assert.deepEqual(unopened, { action: "accept" });
+  assert.match(notices.join("\n"), /Open this URL yourself: https:\/\/billing\.example\.com\/connect/);
+  if (process.platform !== "win32") {
+    const prevPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      assert.equal(await openExternalBrowser("https://billing.example.com/connect"), false, "a missing opener reports failure");
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  }
 
   // Form mode: fill email + integer + single-enum + multi-enum, edit email during review, then Submit
   const selectQueue = [
@@ -866,6 +890,20 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     }
     assert.equal(ext.tools.has("mcp__pure26__trigger_changes"), true, "pure 2026-07-28 fallback tool registered");
     assert.equal(ext.commands.has("mcp-prompt:pure26:review"), true, "per-prompt slash command registered");
+    for (let i = 0; i < 40 && !ext.commands.has("mcp-skill:pure26:code-audit"); i += 1) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(ext.commands.has("mcp-skill:pure26:code-audit"), true, "per-skill slash command registered");
+
+    const { systemPromptOptions } = await runner.emitBeforeAgentStart(
+      { messageType: "user", prompt: "audit this repo" },
+      { cwd: projectDir },
+    );
+    assert.match(
+      systemPromptOptions.sections.mcp_skills,
+      /<mcp_skill server="pure26" name="code-audit" uri="skill:\/\/code-audit\/SKILL\.md">Audit repository security\.<\/mcp_skill>/,
+      "listed skills reach the system prompt before each run",
+    );
 
     const ctx = runner.createToolContext("c-1", undefined);
 
@@ -972,6 +1010,32 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(listedSkills.skills.length, 1);
     const probeReads = await triggerTool.execute("c-10", { action: "noop" }, undefined, undefined, ctx);
     assert.match(probeReads.content[0].text, /reads=0/, "skills/list must NOT eagerly fetch skill files");
+
+    skillConfirmApprove = false;
+    await assert.rejects(
+      () =>
+        skillsTool.execute(
+          "c-10b",
+          { action: "load", server: "pure26", uri: "skill://code-audit/SKILL.md" },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      /User declined/,
+      "a model load still asks for approval",
+    );
+    await ext.commands.get("mcp-skill:pure26:code-audit").handler("  src/  ", runner.createCommandContext());
+    skillConfirmApprove = true;
+    assert.equal(
+      sessionEntries.filter((e) => e.customType === "mcp-ext:skill-approvals").length,
+      1,
+      "the typed command records the approval",
+    );
+    const skillMessage = userMessages.at(-1);
+    assert.match(skillMessage, /<mcp_skill server="pure26" uri="skill:\/\/code-audit\/SKILL\.md" name="code-audit">/);
+    assert.match(skillMessage, /# Code Audit/, "typing the command loads the skill without the approval prompt");
+    assert.match(skillMessage, /action "read_file"/, "points the model at the supporting files");
+    assert.ok(skillMessage.endsWith("\n\nsrc/"), "arguments follow the skill");
 
     const dirListing = JSON.parse(
       (

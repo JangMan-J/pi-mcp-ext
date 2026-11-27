@@ -13,8 +13,9 @@ import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs
 import { dirname, join, posix } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { canonicalJson } from "./events.ts";
-import { paginateMcp } from "./framing.ts";
+import { frameMcpTag, paginateMcp } from "./framing.ts";
 import { createPrivateSubdir } from "./temp-files.ts";
+import { backgroundTimer } from "./timer.ts";
 import { CUSTOM_SKILL_APPROVALS } from "./types.ts";
 import type {
   EngineHost,
@@ -26,6 +27,8 @@ import type {
 
 const MAX_SKILL_FILES = 512;
 const MAX_SKILL_BYTES = 16 * 1024 * 1024; // 16 MiB
+const MAX_PROMPT_SKILLS_PER_SERVER = 100;
+const MAX_PROMPT_DESCRIPTION_CHARS = 1024;
 
 export interface SkillResourceManifestItem {
   uri: string;
@@ -52,8 +55,39 @@ export interface LoadedSkillResult {
 
 type LogOpts = { logLevel?: McpLogLevel; onLog?: (entry: McpLogMessage) => void };
 
+export interface ListedSkills {
+  server: string;
+  skills: SkillEntry[];
+}
+
+export function formatSkillsPromptSection(listed: readonly ListedSkills[]): string | undefined {
+  const lines: string[] = [];
+  for (const { server, skills } of listed) {
+    const visible = skills.filter((s) => s.frontmatter["disable-model-invocation"] !== true);
+    for (const skill of visible.slice(0, MAX_PROMPT_SKILLS_PER_SERVER)) {
+      lines.push(
+        frameMcpTag(
+          "mcp_skill",
+          { server, name: skill.frontmatter.name, uri: skill.uri },
+          skill.frontmatter.description.slice(0, MAX_PROMPT_DESCRIPTION_CHARS),
+        ),
+      );
+    }
+  }
+  if (lines.length === 0) return undefined;
+  return [
+    'These skills come from MCP servers. When a task matches a skill\'s description, load it with the mcp_skills tool (action "load" with its server and uri) and follow it.',
+    ...lines,
+  ].join("\n");
+}
+
 export interface SkillsEngineApi {
   restore(allEntries: readonly unknown[]): void;
+  serverReady(server: string): Promise<void>;
+  serverRemoved(server: string): void;
+  listed(): ListedSkills[];
+  refreshStale(waitMs: number): Promise<void>;
+  onSkillsListed(listener: (server: string, skills: SkillEntry[]) => void): () => void;
   list(server: string, opts?: LogOpts): Promise<SkillEntry[]>;
   get(server: string, uri: string, opts?: LogOpts): Promise<SkillEntry>;
   load(
@@ -273,6 +307,9 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
   const retained = new Map<string, SkillEntry>(); // key: `${server}\0${uri}`
   const loadedSkills = new Set<string>(); // key: `${server}\0${uri}`
   const approvedFingerprints = new Set<string>();
+  const listings = new Map<string, { skills: SkillEntry[]; freshUntil: number }>();
+  const refreshes = new Map<string, Promise<void>>();
+  const listedListeners = new Set<(server: string, skills: SkillEntry[]) => void>();
   let cacheRoot: string | undefined;
   let shutDown = false;
 
@@ -312,17 +349,18 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
 
   async function list(server: string, opts?: LogOpts): Promise<SkillEntry[]> {
     const client = requireSkillsClient(server);
-    return paginateMcp(
+    let ttlMs: number | undefined;
+    const skills = await paginateMcp(
       client,
       "skills/list",
       (res) => {
+        const pageTtl = typeof res.ttlMs === "number" && res.ttlMs > 0 ? res.ttlMs : 0;
+        ttlMs = Math.min(ttlMs ?? pageTtl, pageTtl);
         const page: SkillEntry[] = [];
         const rawSkills = Array.isArray(res.skills) ? res.skills : [];
         for (const raw of rawSkills) {
           try {
-            const entry = parseSkillEntry(raw);
-            retained.set(entryKey(server, entry.uri), entry);
-            page.push(entry);
+            page.push(parseSkillEntry(raw));
           } catch (err) {
             host.log("warn", `[${server}] Skipping invalid MCP skill entry: ${err instanceof Error ? err.message : String(err)}`);
           }
@@ -332,13 +370,85 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
       {},
       toReqOpts(opts),
     );
+    for (const entry of skills) retain(server, entry);
+    if (shutDown) return skills;
+    listings.set(server, { skills, freshUntil: Date.now() + (ttlMs ?? 0) });
+    for (const fn of [...listedListeners]) {
+      try {
+        fn(server, skills);
+      } catch {
+        /* ignore */
+      }
+    }
+    return skills;
+  }
+
+  function startRefresh(server: string): Promise<void> {
+    const existing = refreshes.get(server);
+    if (existing) return existing;
+    const refresh: Promise<void> = list(server)
+      .then(
+        () => {},
+        (err) => {
+          host.log("warn", `MCP server "${server}" skills listing failed: ${err instanceof Error ? err.message : String(err)}`);
+        },
+      )
+      .finally(() => {
+        if (refreshes.get(server) === refresh) refreshes.delete(server);
+      });
+    refreshes.set(server, refresh);
+    return refresh;
+  }
+
+  function serverReady(server: string): Promise<void> {
+    if (shutDown || !host.getClient(server)?.state.skills) return Promise.resolve();
+    listings.set(server, { skills: [], freshUntil: 0 });
+    return startRefresh(server);
+  }
+
+  function serverRemoved(server: string): void {
+    listings.delete(server);
+    refreshes.delete(server);
+  }
+
+  function listed(): ListedSkills[] {
+    const out: ListedSkills[] = [];
+    for (const [server, { skills }] of listings) {
+      if (host.getClient(server)) out.push({ server, skills });
+    }
+    return out;
+  }
+
+  async function refreshStale(waitMs: number): Promise<void> {
+    const now = Date.now();
+    const pending: Promise<void>[] = [];
+    for (const [server, listing] of listings) {
+      if (listing.freshUntil > now || !host.getClient(server)) continue;
+      pending.push(startRefresh(server));
+    }
+    if (pending.length === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.all(pending),
+      new Promise<void>((resolve) => {
+        timer = backgroundTimer(setTimeout(resolve, waitMs));
+      }),
+    ]);
+    clearTimeout(timer);
   }
 
   async function get(server: string, uri: string, opts?: LogOpts): Promise<SkillEntry> {
     const client = requireSkillsClient(server);
     const res = await client.request<JsonObject>("skills/get", { uri }, toReqOpts(opts));
-    const entry = parseSkillEntry(res.skill);
-    retained.set(entryKey(server, entry.uri), entry);
+    return retain(server, parseSkillEntry(res.skill));
+  }
+
+  function retain(server: string, entry: SkillEntry): SkillEntry {
+    const key = entryKey(server, entry.uri);
+    const previous = retained.get(key);
+    if (previous && canonicalJson(previous) === canonicalJson(entry)) return previous;
+    loadedSkills.delete(key);
+    retained.set(key, entry);
     return entry;
   }
 
@@ -451,14 +561,15 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
       );
     }
 
+    const current = retained.get(k) === entry;
     let cacheDir: string | undefined;
-    if (entry.resources !== "dynamic") {
+    if (current && entry.resources !== "dynamic") {
       const skillParent = join(getCacheRoot(), shortHash(server), shortHash(entry.uri), entry.frontmatter.name);
       const skillMdPath = join(skillParent, "SKILL.md");
       writeReadOnlyFile(skillMdPath, bytes);
       cacheDir = skillParent;
     }
-    loadedSkills.add(k);
+    if (current) loadedSkills.add(k);
 
     const supportingUris =
       entry.resources === "dynamic"
@@ -596,6 +707,9 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
     host.signal?.removeEventListener?.("abort", onAbort);
     loadedSkills.clear();
     retained.clear();
+    listings.clear();
+    refreshes.clear();
+    listedListeners.clear();
     if (cacheRoot) {
       try {
         rmSync(cacheRoot, { recursive: true, force: true });
@@ -608,6 +722,16 @@ export function createSkillsEngine(host: EngineHost): SkillsEngineApi {
 
   return {
     restore,
+    serverReady,
+    serverRemoved,
+    listed,
+    refreshStale,
+    onSkillsListed: (listener) => {
+      listedListeners.add(listener);
+      return () => {
+        listedListeners.delete(listener);
+      };
+    },
     list,
     get,
     load,
